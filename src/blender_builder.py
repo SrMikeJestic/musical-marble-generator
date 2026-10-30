@@ -5,6 +5,8 @@ Execute da raiz do projeto com Blender 4.2 ou superior::
     blender --background --python src/blender_builder.py
 
 O exemplo salva ``test_scene.blend`` na raiz do projeto, sem renderizar vídeo.
+Com ``-- --scene-json plano.json --video-output video.mp4``, consome o plano do
+orquestrador e renderiza a animação H.264, sem criar o arquivo de teste.
 Os tempos absolutos do solver são preservados: frame = 1 + timestamp * FPS.
 Há chaves em todos os frames e nos contatos, inclusive em frames fracionários.
 
@@ -14,6 +16,8 @@ Como X é linear no tempo, essa transformação mantém os arcos parabólicos e 
 aceleração vertical. Use descent=0 para visualizar o layout horizontal original.
 """
 
+import argparse
+import json
 import math
 import sys
 from bisect import bisect_right
@@ -166,16 +170,26 @@ def build_scene(
     timestamps: Iterable[float],
     *,
     descent: float = 0.35,
+    segments: Iterable[TrajectorySegment] | None = None,
+    frame_end: int | None = None,
 ) -> bpy.types.Scene:
     """Limpa a cena ativa e constrói o layout a partir de timestamps em segundos.
 
     ``descent`` é a queda em Z por metro em X, finita e não negativa. A câmera
     acompanha X e a descida de base em Z, sem copiar os saltos verticais; uma
-    constraint mantém a esfera enquadrada. Nenhum corpo rígido é criado.
+    constraint mantém a esfera enquadrada. ``segments`` recebe a matemática já
+    calculada no JSON; ``frame_end`` inclui a duração das notas e a cauda sonora.
+    Nenhum corpo rígido é criado.
     """
     if not math.isfinite(descent) or descent < 0:
         raise ValueError("A inclinação deve ser finita e não negativa.")
-    arcs = solve_layout(timestamps)
+    times = tuple(timestamps)
+    arcs = list(segments) if segments is not None else solve_layout(times)
+    if not arcs or (arcs[0].start_time, *(arc.end_time for arc in arcs)) != times:
+        raise ValueError("Os segmentos devem corresponder aos timestamps do plano.")
+    minimum_frame_end = math.ceil(arcs[-1].end_time * FPS) + 1
+    if frame_end is not None and (not isinstance(frame_end, int) or frame_end < minimum_frame_end):
+        raise ValueError("O frame final precisa incluir todos os contatos.")
     scene = bpy.context.scene
     for obj in list(scene.objects):
         bpy.data.objects.remove(obj, do_unlink=True)
@@ -192,7 +206,7 @@ def build_scene(
     scene.unit_settings.system = "METRIC"
     scene.view_settings.view_transform = "AgX"
     scene.frame_start = 1
-    scene.frame_end = math.ceil(arcs[-1].end_time * FPS) + 1
+    scene.frame_end = minimum_frame_end if frame_end is None else frame_end
 
     glass = create_pbr_material(
         "BallGlass", (0.62, 0.87, 0.95, 1.0), roughness=0.10, transmission=1.0
@@ -293,8 +307,56 @@ def build_scene(
     return scene
 
 
+def render_scene_plan(plan_path: Path, video_path: Path) -> None:
+    """Consome a matemática calculada pelo CLI e renderiza um MP4 sem áudio."""
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    if plan["schema_version"] != 1 or plan["fps"] != FPS:
+        raise ValueError("Versão do plano ou FPS incompatíveis com este builder.")
+    percentage = plan["resolution_percentage"]
+    samples = plan["render_samples"]
+    if not isinstance(percentage, int) or not 1 <= percentage <= 100:
+        raise ValueError("A escala de resolução deve ser um inteiro entre 1 e 100.")
+    if not isinstance(samples, int) or samples < 1:
+        raise ValueError("O número de amostras deve ser um inteiro positivo.")
+    scene = build_scene(
+        plan["timestamps"], descent=plan["descent"],
+        segments=[TrajectorySegment(**segment) for segment in plan["segments"]],
+        frame_end=plan["frame_end"],
+    )
+    # H.264 exige dimensões pares. Múltiplos de 18x32 preservam também o 9:16
+    # em escalas pequenas, cuja porcentagem pode produzir dimensões ímpares.
+    scale_unit = max(2, 2 * round((RESOLUTION_X / 9) * percentage / 200))
+    scene.render.resolution_x = 9 * scale_unit
+    scene.render.resolution_y = 16 * scale_unit
+    scene.render.resolution_percentage = 100
+    scene.eevee.taa_render_samples = samples
+    scene.render.image_settings.file_format = "FFMPEG"
+    scene.render.ffmpeg.format = "MPEG4"
+    scene.render.ffmpeg.codec = "H264"
+    scene.render.ffmpeg.constant_rate_factor = "HIGH"
+    scene.render.ffmpeg.ffmpeg_preset = "GOOD"
+    scene.render.ffmpeg.audio_codec = "NONE"
+    video_path = video_path.expanduser().resolve()
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    scene.render.filepath = str(video_path)
+    bpy.ops.render.render(animation=True)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Constrói cena de teste ou renderiza plano JSON.")
+    parser.add_argument("--scene-json", type=Path)
+    parser.add_argument("--video-output", type=Path)
+    args = parser.parse_args(sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else [])
+    if args.scene_json is not None or args.video_output is not None:
+        if args.scene_json is None or args.video_output is None:
+            parser.error("--scene-json e --video-output devem ser usados juntos.")
+        render_scene_plan(args.scene_json, args.video_output)
+    else:
+        build_scene([0.0, 0.5, 1.1, 1.55, 2.2, 2.7, 3.25, 3.8])
+        output_path = Path(__file__).resolve().parents[1] / "test_scene.blend"
+        bpy.ops.wm.save_as_mainfile(filepath=str(output_path))
+        print(f"Cena de teste salva em: {output_path}")
+
+
 if __name__ == "__main__":
-    build_scene([0.0, 0.5, 1.1, 1.55, 2.2, 2.7, 3.25, 3.8])
-    output_path = Path(__file__).resolve().parents[1] / "test_scene.blend"
-    bpy.ops.wm.save_as_mainfile(filepath=str(output_path))
-    print(f"Cena de teste salva em: {output_path}")
+    main()
