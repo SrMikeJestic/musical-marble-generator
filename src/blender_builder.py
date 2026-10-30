@@ -1,0 +1,300 @@
+"""Constrói e anima uma cena EEVEE inteiramente procedural, sem Rigid Body.
+
+Execute da raiz do projeto com Blender 4.2 ou superior::
+
+    blender --background --python src/blender_builder.py
+
+O exemplo salva ``test_scene.blend`` na raiz do projeto, sem renderizar vídeo.
+Os tempos absolutos do solver são preservados: frame = 1 + timestamp * FPS.
+Há chaves em todos os frames e nos contatos, inclusive em frames fracionários.
+
+O solver fornece pontos de contato. O builder soma o raio ao Z da esfera e
+aplica uma inclinação configurável: z_visual = z_solver - descent * (x - x0).
+Como X é linear no tempo, essa transformação mantém os arcos parabólicos e a
+aceleração vertical. Use descent=0 para visualizar o layout horizontal original.
+"""
+
+import math
+import sys
+from bisect import bisect_right
+from pathlib import Path
+from typing import Iterable
+
+import bpy
+from mathutils import Vector
+
+# --python executa este arquivo sem contexto de pacote. Permite também importá-lo
+# normalmente com `from src.blender_builder import build_scene` dentro do Blender.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from src.config import FPS, RESOLUTION_PERCENTAGE, RESOLUTION_X, RESOLUTION_Y
+    from src.layout_solver import TrajectorySegment, solve_layout
+else:
+    from .config import FPS, RESOLUTION_PERCENTAGE, RESOLUTION_X, RESOLUTION_Y
+    from .layout_solver import TrajectorySegment, solve_layout
+
+
+BALL_RADIUS = 0.16
+WALL_Y = 1.4
+PLATFORM_DEPTH = 0.8
+PLATFORM_THICKNESS = 0.18
+PALETTE = (
+    (0.95, 0.20, 0.16, 1.0),
+    (1.00, 0.61, 0.10, 1.0),
+    (0.13, 0.64, 0.54, 1.0),
+    (0.18, 0.44, 0.85, 1.0),
+    (0.60, 0.28, 0.78, 1.0),
+)
+
+
+def create_pbr_material(
+    name: str,
+    color: tuple[float, float, float, float],
+    *,
+    metallic: float = 0.0,
+    roughness: float = 0.5,
+    transmission: float = 0.0,
+) -> bpy.types.Material:
+    """Material Principled BSDF por nodes, compatível com EEVEE Next."""
+    material = bpy.data.materials.new(name)
+    material.use_nodes = True
+    material.diffuse_color = color
+    nodes = material.node_tree.nodes
+    nodes.clear()
+    shader = nodes.new("ShaderNodeBsdfPrincipled")
+    shader.inputs["Base Color"].default_value = color
+    shader.inputs["Metallic"].default_value = metallic
+    shader.inputs["Roughness"].default_value = roughness
+    shader.inputs["Transmission Weight"].default_value = transmission
+    shader.inputs["IOR"].default_value = 1.45
+    output = nodes.new("ShaderNodeOutputMaterial")
+    material.node_tree.links.new(shader.outputs["BSDF"], output.inputs["Surface"])
+    if transmission:
+        material.use_raytrace_refraction = True
+    return material
+
+
+def assign_material(obj: bpy.types.Object, material: bpy.types.Material) -> None:
+    obj.data.materials.clear()
+    obj.data.materials.append(material)
+
+
+def _linear_keyframes(obj: bpy.types.Object) -> None:
+    """Evita overshoot Bezier entre amostras e nos impactos da bolinha."""
+    action = obj.animation_data.action
+    if hasattr(action, "fcurves"):
+        curves = action.fcurves
+    else:
+        # Actions em camadas das versões mais recentes do Blender.
+        slot = obj.animation_data.action_slot
+        curves = []
+        for layer in action.layers:
+            for strip in layer.strips:
+                bag = strip.channelbag(slot)
+                if bag is not None:
+                    curves.extend(bag.fcurves)
+    for curve in curves:
+        for key in curve.keyframe_points:
+            key.interpolation = "LINEAR"
+
+
+def _make_platform(
+    index: int,
+    x: float,
+    contact_z: float,
+    width: float,
+    material: bpy.types.Material,
+    chrome: bpy.types.Material,
+) -> None:
+    bpy.ops.mesh.primitive_cube_add(
+        size=1.0, location=(x, 0.0, contact_z - PLATFORM_THICKNESS / 2)
+    )
+    platform = bpy.context.object
+    platform.name = f"Platform_{index:03d}"
+    platform.dimensions = (width, PLATFORM_DEPTH, PLATFORM_THICKNESS)
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+    bevel = platform.modifiers.new("Soft edges", "BEVEL")
+    bevel.width = min(0.025, width / 8)
+    bevel.segments = 3
+    assign_material(platform, material)
+
+    # Cilindro alinhado em Y, da face traseira da tecla até a parede XZ.
+    pin_start_y = PLATFORM_DEPTH / 2
+    pin_length = WALL_Y - pin_start_y
+    bpy.ops.mesh.primitive_cylinder_add(
+        vertices=32,
+        radius=min(0.045, width / 4),
+        depth=pin_length,
+        location=(x, (WALL_Y + pin_start_y) / 2, contact_z - PLATFORM_THICKNESS / 2),
+        rotation=(math.pi / 2, 0.0, 0.0),
+    )
+    pin = bpy.context.object
+    pin.name = f"Pin_{index:03d}"
+    for polygon in pin.data.polygons:
+        polygon.use_smooth = len(polygon.vertices) == 4
+    assign_material(pin, chrome)
+
+
+def _setup_lighting(scene: bpy.types.Scene) -> None:
+    world = bpy.data.worlds.new("MarbleWorld")
+    world.use_nodes = True
+    world.node_tree.nodes["Background"].inputs["Color"].default_value = (
+        0.55, 0.65, 0.80, 1.0
+    )
+    world.node_tree.nodes["Background"].inputs["Strength"].default_value = 0.35
+    scene.world = world
+
+    bpy.ops.object.light_add(type="SUN", location=(-4.0, -6.0, 10.0))
+    sun = bpy.context.object
+    sun.name = "KeySun"
+    sun.data.energy = 3.0
+    sun.data.angle = math.radians(1.0)
+    sun.data.use_shadow = True
+    # Raios viajam para a parede (+Y) e para baixo (-Z).
+    sun.rotation_euler = Vector((0.45, 1.0, -0.7)).to_track_quat("-Z", "Y").to_euler()
+
+    # Preenchimento amplo acompanha a câmera e cria reflexos no vidro/cromo.
+    bpy.ops.object.light_add(type="AREA")
+    fill = bpy.context.object
+    fill.name = "CameraFill"
+    fill.data.energy = 500.0
+    fill.data.shape = "DISK"
+    fill.data.size = 5.0
+
+
+def build_scene(
+    timestamps: Iterable[float],
+    *,
+    descent: float = 0.35,
+) -> bpy.types.Scene:
+    """Limpa a cena ativa e constrói o layout a partir de timestamps em segundos.
+
+    ``descent`` é a queda em Z por metro em X, finita e não negativa. A câmera
+    acompanha X e a descida de base em Z, sem copiar os saltos verticais; uma
+    constraint mantém a esfera enquadrada. Nenhum corpo rígido é criado.
+    """
+    if not math.isfinite(descent) or descent < 0:
+        raise ValueError("A inclinação deve ser finita e não negativa.")
+    arcs = solve_layout(timestamps)
+    scene = bpy.context.scene
+    for obj in list(scene.objects):
+        bpy.data.objects.remove(obj, do_unlink=True)
+
+    scene.render.engine = "BLENDER_EEVEE_NEXT"
+    scene.eevee.use_raytracing = True
+    scene.render.fps = FPS
+    scene.render.fps_base = 1.0
+    scene.render.resolution_x = RESOLUTION_X
+    scene.render.resolution_y = RESOLUTION_Y
+    scene.render.resolution_percentage = RESOLUTION_PERCENTAGE
+    scene.render.pixel_aspect_x = scene.render.pixel_aspect_y = 1.0
+    scene.render.image_settings.file_format = "PNG"
+    scene.unit_settings.system = "METRIC"
+    scene.view_settings.view_transform = "AgX"
+    scene.frame_start = 1
+    scene.frame_end = math.ceil(arcs[-1].end_time * FPS) + 1
+
+    glass = create_pbr_material(
+        "BallGlass", (0.62, 0.87, 0.95, 1.0), roughness=0.10, transmission=1.0
+    )
+    chrome = create_pbr_material(
+        "PinChrome", (0.72, 0.76, 0.82, 1.0), metallic=1.0, roughness=0.18
+    )
+    wall_material = create_pbr_material(
+        "PastelWall", (0.64, 0.73, 0.80, 1.0), roughness=0.90
+    )
+    plastics = [
+        create_pbr_material(f"PlatformPlastic_{i}", color, roughness=0.65)
+        for i, color in enumerate(PALETTE)
+    ]
+
+    origin_x = arcs[0].start_x
+
+    def contact_z(x: float, z: float) -> float:
+        return z - descent * (x - origin_x)
+
+    contacts = [(arcs[0].start_time, arcs[0].start_x, arcs[0].platform_z)]
+    contacts.extend((arc.end_time, arc.end_x, arc.platform_z) for arc in arcs)
+    for i, (_, x, z) in enumerate(contacts):
+        gaps = []
+        if i:
+            gaps.append(x - contacts[i - 1][1])
+        if i + 1 < len(contacts):
+            gaps.append(contacts[i + 1][1] - x)
+        width = min(0.9, 0.6 * min(gaps))
+        _make_platform(i, x, contact_z(x, z), width, plastics[i % len(plastics)], chrome)
+
+    # Margens cobrem o enquadramento da câmera e as sombras no início/fim.
+    min_z = min(contact_z(x, z) for _, x, z in contacts) - 10.0
+    max_z = max(
+        contact_z(arc.start_x, arc.platform_z) + arc.gravity * arc.duration**2 / 8
+        for arc in arcs
+    ) + 10.0
+    width = arcs[-1].end_x - origin_x + 20.0
+    bpy.ops.mesh.primitive_plane_add(
+        size=1.0,
+        location=((origin_x + arcs[-1].end_x) / 2, WALL_Y, (min_z + max_z) / 2),
+        rotation=(math.pi / 2, 0.0, 0.0),
+    )
+    wall = bpy.context.object
+    wall.name = "BackdropWall"
+    wall.scale = (width, max_z - min_z, 1.0)
+    assign_material(wall, wall_material)
+
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=48, ring_count=24, radius=BALL_RADIUS)
+    ball = bpy.context.object
+    ball.name = "Marble"
+    for polygon in ball.data.polygons:
+        polygon.use_smooth = True
+    assign_material(ball, glass)
+
+    bpy.ops.object.camera_add()
+    camera = bpy.context.object
+    camera.name = "FollowCamera"
+    camera.data.type = "PERSP"
+    camera.data.lens = 40.0
+    camera.data.clip_start = 0.05
+    camera.data.clip_end = max(200.0, width * 2, max_z - min_z)
+    camera.data.dof.use_dof = False
+    tracking = camera.constraints.new("TRACK_TO")
+    tracking.target = ball
+    tracking.track_axis = "TRACK_NEGATIVE_Z"
+    tracking.up_axis = "UP_Y"
+    scene.camera = camera
+
+    _setup_lighting(scene)
+    fill = scene.objects["CameraFill"]
+    fill.parent = camera
+    fill.location = (-3.0, 3.0, -1.0)
+    fill.rotation_euler = (0.0, 0.0, 0.0)
+
+    # Incluir contatos fracionários evita deslocar notas que não caem em 1/60 s.
+    keyframes = {float(frame) for frame in range(scene.frame_start, scene.frame_end + 1)}
+    keyframes.update(1 + t * FPS for t, _, _ in contacts)
+    end_times = [arc.end_time for arc in arcs]
+    for frame in sorted(keyframes):
+        timestamp = min(max((frame - 1) / FPS, arcs[0].start_time), arcs[-1].end_time)
+        arc: TrajectorySegment = arcs[min(bisect_right(end_times, timestamp), len(arcs) - 1)]
+        x, z = arc.position_at(timestamp)
+        ball.location = (x, 0.0, contact_z(x, z) + BALL_RADIUS)
+        ball.keyframe_insert(data_path="location", frame=frame)
+        camera.location = (x, -10.0, contact_z(x, arc.platform_z) + 3.0)
+        camera.keyframe_insert(data_path="location", frame=frame)
+    _linear_keyframes(ball)
+    _linear_keyframes(camera)
+
+    for i, (timestamp, _, _) in enumerate(contacts):
+        # Marcadores são inteiros no Blender; as chaves mantêm o tempo exato.
+        scene.timeline_markers.new(f"Note_{i:03d}", frame=round(1 + timestamp * FPS))
+    scene.frame_set(scene.frame_start)
+    bpy.ops.object.select_all(action="DESELECT")
+    ball.select_set(True)
+    bpy.context.view_layer.objects.active = ball
+    return scene
+
+
+if __name__ == "__main__":
+    build_scene([0.0, 0.5, 1.1, 1.55, 2.2, 2.7, 3.25, 3.8])
+    output_path = Path(__file__).resolve().parents[1] / "test_scene.blend"
+    bpy.ops.wm.save_as_mainfile(filepath=str(output_path))
+    print(f"Cena de teste salva em: {output_path}")
