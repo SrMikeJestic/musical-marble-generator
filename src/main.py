@@ -38,7 +38,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--soundfont", type=Path, default=os.environ.get("SOUNDFONT"),
                         help="SoundFont .sf2 (ou variável de ambiente SOUNDFONT)")
     parser.add_argument("-o", "--output", type=Path, default=Path("output_final.mp4"))
-    parser.add_argument("--blender", default="blender", help="Executável do Blender 4.2+")
+    parser.add_argument("--blender", default="blender", help="Executável do Blender 4.0.2")
     parser.add_argument("--ffmpeg", default="ffmpeg", help="Executável do FFmpeg")
     parser.add_argument("--descent", type=float, default=0.35, help="Queda em Z por metro em X")
     parser.add_argument("--tail-seconds", type=float, default=1.0,

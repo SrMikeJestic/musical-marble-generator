@@ -1,6 +1,6 @@
 """Constrói e anima uma cena EEVEE inteiramente procedural, sem Rigid Body.
 
-Execute da raiz do projeto com Blender 4.2 ou superior::
+Execute da raiz do projeto com Blender 4.0.2 (EEVEE clássico)::
 
     blender --background --python src/blender_builder.py
 
@@ -59,7 +59,11 @@ def create_pbr_material(
     roughness: float = 0.5,
     transmission: float = 0.0,
 ) -> bpy.types.Material:
-    """Material Principled BSDF por nodes, compatível com EEVEE Next."""
+    """Material PBR do EEVEE 4.0.2, com transparência de superfície para vidro.
+
+    ``transmission`` mistura o Principled com Transparent BSDF, aproximando
+    vidro translúcido sem refração óptica ou rastreamento de raios.
+    """
     material = bpy.data.materials.new(name)
     material.use_nodes = True
     material.diffuse_color = color
@@ -69,12 +73,20 @@ def create_pbr_material(
     shader.inputs["Base Color"].default_value = color
     shader.inputs["Metallic"].default_value = metallic
     shader.inputs["Roughness"].default_value = roughness
-    shader.inputs["Transmission Weight"].default_value = transmission
     shader.inputs["IOR"].default_value = 1.45
     output = nodes.new("ShaderNodeOutputMaterial")
-    material.node_tree.links.new(shader.outputs["BSDF"], output.inputs["Surface"])
     if transmission:
-        material.use_raytrace_refraction = True
+        transparent = nodes.new("ShaderNodeBsdfTransparent")
+        mix = nodes.new("ShaderNodeMixShader")
+        mix.inputs[0].default_value = 0.7 * transmission
+        material.node_tree.links.new(shader.outputs["BSDF"], mix.inputs[1])
+        material.node_tree.links.new(transparent.outputs["BSDF"], mix.inputs[2])
+        material.node_tree.links.new(mix.outputs[0], output.inputs["Surface"])
+        material.blend_method = "BLEND"
+        material.shadow_method = "HASHED"
+        material.show_transparent_back = False
+    else:
+        material.node_tree.links.new(shader.outputs["BSDF"], output.inputs["Surface"])
     return material
 
 
@@ -85,19 +97,7 @@ def assign_material(obj: bpy.types.Object, material: bpy.types.Material) -> None
 
 def _linear_keyframes(obj: bpy.types.Object) -> None:
     """Evita overshoot Bezier entre amostras e nos impactos da bolinha."""
-    action = obj.animation_data.action
-    if hasattr(action, "fcurves"):
-        curves = action.fcurves
-    else:
-        # Actions em camadas das versões mais recentes do Blender.
-        slot = obj.animation_data.action_slot
-        curves = []
-        for layer in action.layers:
-            for strip in layer.strips:
-                bag = strip.channelbag(slot)
-                if bag is not None:
-                    curves.extend(bag.fcurves)
-    for curve in curves:
+    for curve in obj.animation_data.action.fcurves:
         for key in curve.keyframe_points:
             key.interpolation = "LINEAR"
 
@@ -194,8 +194,9 @@ def build_scene(
     for obj in list(scene.objects):
         bpy.data.objects.remove(obj, do_unlink=True)
 
-    scene.render.engine = "BLENDER_EEVEE_NEXT"
-    scene.eevee.use_raytracing = True
+    scene.render.engine = "BLENDER_EEVEE"
+    scene.eevee.use_ssr = False
+    scene.eevee.use_ssr_refraction = False
     scene.render.fps = FPS
     scene.render.fps_base = 1.0
     scene.render.resolution_x = RESOLUTION_X
