@@ -1,187 +1,138 @@
-# musical-marble-generator
+# Musical Marble Generator
 
 Gerador headless de vídeos musicais 3D em 9:16, com cinemática determinística
-dirigida por MIDI. Não usa Rigid Body.
+orientada por MIDI. O projeto usa Blender 4.0.2, Cycles CUDA e FFmpeg. Não usa
+Rigid Body. As regras de contribuição estão em [AGENTS.md](AGENTS.md) e o
+checklist de passos está em [PLANO.md](PLANO.md).
 
-Requer Python 3.10+, Blender 4.0.2 com Cycles CUDA e suporte H.264, FFmpeg, a biblioteca
-nativa FluidSynth e uma SoundFont General MIDI `.sf2` fornecida pelo usuário.
-No Debian/Ubuntu, os pacotes `blender`, `ffmpeg`, `libfluidsynth3` e
-`fluid-soundfont-gm` fornecem as ferramentas e uma SoundFont; confirme que a
-versão instalada do Blender é 4.0.2, como no ambiente Google Colab deste projeto.
-No Colab, selecione um runtime com GPU NVIDIA. O builder exige CUDA, ativa somente
-as GPUs CUDA nas preferências do Cycles e define `scene.cycles.device = 'GPU'`.
-Se CUDA ou a GPU não estiverem disponíveis, o script encerra com erro antes de
-construir a geometria. Não há fallback para CPU. O máximo é de 64 samples por
-frame; `--render-samples` permite menos amostras para prévias e valores maiores
-são limitados a 64. O vidro mantém a aproximação translúcida por shader.
-No render final e em `--test-frame`, o denoising de render, prévia e camadas é
-desativado explicitamente, assim como os passes auxiliares e o compositor, para
-suportar builds sem OpenImageDenoise. O modo `--draft` habilita denoising nativo:
-prefere OptiX em GPU disponível e usa OpenImageDenoise somente se o build o inclui.
-Sem nenhum denoiser suportado, o draft encerra com uma mensagem clara; não tenta
-usar uma biblioteca ausente. A renderização permanece em CUDA e o compositor fica
-desativado em todos os modos.
+## Como rodar no Kaggle: três células
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python src/main.py input.mid --soundfont /caminho/GeneralUser.sf2 -o output_final.mp4
-```
+Antes de começar, habilite **Internet** e uma **GPU NVIDIA** nas configurações do
+notebook. Adicione um dataset com seu MIDI e substitua o caminho de exemplo na
+célula 3. Execute as células na ordem. Estas instruções são documentação: nenhum
+script de automação ou default do código é alterado por este marco.
 
-Também é possível definir `SOUNDFONT=/caminho/GeneralUser.sf2` e executar
-`python src/main.py input.mid`. Os pacotes Python são instalados no Python do CLI;
-o Python embutido no Blender usa apenas `bpy` e a biblioteca padrão.
+### Célula 1 — Instalar Blender 4.0.2 e dependências de áudio
 
-O CLI interpreta mudanças de andamento, agrupa notas simultâneas em um contato
-da bolinha e calcula os arcos com o solver. Em seguida, entrega um JSON ao Blender,
-renderiza frames PNG a 1080×1920 e 60 FPS, codifica H.264 pelo FFmpeg e sintetiza WAV mono PCM de 24 bits a
-48 kHz com FluidSynth e combina vídeo e áudio AAC de 320 kb/s pelo FFmpeg.
-Sem limite de duração, todas as notas e instrumentos do MIDI original permanecem no áudio.
-
-Os tempos são absolutos: a nota em `t` corresponde ao frame `1 + 60*t`.
-Contatos entre frames inteiros mantêm chaves fracionárias. O silêncio inicial é
-preservado e a câmera/bolinha aguardam no primeiro contato; após o último contato,
-a imagem permanece na última plataforma até o fim do MIDI mais um segundo de
-cauda. A duração é arredondada para frames completos e aplicada também ao áudio.
-Os frames e o plano da cena permanecem no cache após sucesso ou falha; apenas os
-temporários de codificação e áudio são removidos. A saída só é publicada após o
-muxing. Use `--overwrite` para substituir um vídeo existente.
-
-Para persistir o progresso no Google Drive, monte-o no notebook do Colab:
-
-```python
-from google.colab import drive
-drive.mount("/content/drive")
-```
-
-Depois execute:
-
-```bash
-python src/main.py input.mid --soundfont instrumento.sf2 --max-duration 15 \
-  --cache-dir "/content/drive/MyDrive/marble-cache" \
-  -o "/content/drive/MyDrive/output_final.mp4"
-```
-
-`--cache-dir` usa uma pasta já montada; sem a opção, o cache fica em
-`.marble-cache` ao lado da saída. As pastas são isoladas fisicamente por modo:
-`final/<chave>/frames`, `draft/<chave>/frames` e `test-frame/frame_<n>/`.
-Cada render de vídeo tem uma subpasta identificada pelo
-conteúdo do MIDI, plano, configurações e código do builder (incluindo câmera e
-materiais). Mudanças nesses dados geram outro cache automaticamente.
-
-Os arquivos são `frames/frame_000001.png`, `frame_000002.png`, etc. O Blender
-grava primeiro um `.png.part` e só publica o PNG após verificar sua integridade.
-O CLI só pula a etapa 3D se houver **exatamente** os frames `1..N` esperados, sem
-PNGs extras, todos com dimensões corretas, CRCs e dados comprimidos válidos.
-Sequências incompletas retomam apenas frames ausentes ou corrompidos. Uma
-desconexão não apaga os frames concluídos na pasta persistente. Na próxima sessão,
-monte o mesmo Drive e use o mesmo comando e diretório de cache.
-
-`--force` apaga a sequência do cache daquele render e começa do zero, mesmo que
-esteja completa. Outros renders na raiz do cache são preservados. Se o MP4 final
-já existir, acrescente também `--overwrite`; essa opção controla apenas a saída.
-
-O roteiro visual está em [PLANO.md](PLANO.md). O Passo 1 usa World escuro, fundo
-fosco escuro e três luzes Area: principal quente, preenchimento fraco e recorte
-frio. As luzes acompanham a esfera e mantêm o contraste ao longo da trajetória.
-
-Para validar **somente um frame**, no notebook Kaggle, ative uma GPU NVIDIA e
-deixe o Blender 4.0.2 no `PATH`. Execute na raiz do repositório:
-
-```python
-!python src/main.py "/kaggle/input/seu-dataset/musica.mid" \
-    --test-frame 150 --max-duration 15 --resolution-percentage 50 \
-    --test-output "/kaggle/working/passo1_frame150.png"
-
-from IPython.display import Image, display
-display(Image(filename="/kaggle/working/passo1_frame150.png"))
-```
-
-Se o Blender estiver fora do `PATH`, adicione `--blender /caminho/para/blender`.
-Esse modo sempre renderiza exatamente um PNG novo, mesmo se o arquivo de saída
-ou o cache da animação já existirem. Não consulta nem modifica os caches de vídeo;
-registra o PNG de diagnóstico em `test-frame/` e copia para `--test-output`. Não
-codifica vídeo e não sintetiza áudio; SoundFont e FFmpeg não são necessários.
-Sem `--test-output`, salva `test_frame_000150.png` ao lado da saída padrão. O
-frame escolhido deve pertencer à duração do trecho. Para localizar um impacto,
-leia os timestamps do MIDI/plano usando `frame = 1 + 60 * timestamp`; o frame
-150 é apenas um exemplo e pode não coincidir com um impacto em toda música.
-Os materiais avançados, a emissão, o DoF e os carris permanecem para os próximos
-passos do plano, após aprovação.
-
-Para uma prévia rápida, reduza resolução e amostras:
-
-```bash
-python src/main.py input.mid --soundfont instrumento.sf2 --resolution-percentage 10 --render-samples 1
-python src/main.py --help
-```
-
-Para limitar uma música longa aos primeiros 15 segundos:
-
-```bash
-python src/main.py input.mid --soundfont instrumento.sf2 --max-duration 15
-```
-
-`--seconds` é um alias de `--max-duration`; ambos preservam o mesmo cálculo e
-recorte desde o início do MIDI. Para um teste completo de dois segundos, com
-vídeo **e áudio**, use `--draft --seconds 2`. O draft limita a resolução a 25%
-(270×480) e as amostras a 16; opções explícitas menores são respeitadas. Os
-argumentos `--test-frame`, `--max-duration`, `--resolution-percentage` e
-`--test-output` continuam disponíveis. `--draft` e `--test-frame` são modos
-separados e não devem ser combinados.
-
-Em um notebook Kaggle limpo, com internet habilitada, instale o áudio nesta célula
-(não depende de o repositório já estar no diretório atual):
+O Blender é baixado do distribuidor oficial com versão fixa. A SoundFont General
+MIDI de teste é fornecida pelo pacote `timgm6mb-soundfont`. Os pacotes Python
+abaixo correspondem ao `requirements.txt` e são instalados no Python do notebook,
+não no Python embutido do Blender.
 
 ```python
 !apt-get update -qq
-!DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg libfluidsynth3 libsndfile1 timgm6mb-soundfont
+!DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git wget xz-utils ffmpeg libfluidsynth3 libsndfile1 timgm6mb-soundfont libxi6 libxrender1 libxkbcommon0 libsm6 libgl1
+!wget -q "https://download.blender.org/release/Blender4.0/blender-4.0.2-linux-x64.tar.xz" -O "/kaggle/working/blender-4.0.2-linux-x64.tar.xz"
+!tar -xf "/kaggle/working/blender-4.0.2-linux-x64.tar.xz" -C "/kaggle/working"
 %pip install -q "pretty_midi>=0.2.11,<0.3" "pyfluidsynth>=1.3.3,<2" "numpy>=1.26,<3" "soundfile>=0.12,<1" "gTTS>=2.5,<3"
 
 import os
+os.environ["PATH"] = "/kaggle/working/blender-4.0.2-linux-x64:" + os.environ["PATH"]
 os.environ["SOUNDFONT"] = "/usr/share/sounds/sf2/TimGM6mb.sf2"
+!blender --version
+!nvidia-smi
 ```
 
-Com GPU habilitada e Blender 4.0.2 no `PATH`, execute na raiz do repositório:
+### Célula 2 — Clonar ou atualizar o repositório
 
-```bash
-python src/main.py /kaggle/input/seu-dataset/musica.mid \
-  --draft --seconds 2 --soundfont /usr/share/sounds/sf2/TimGM6mb.sf2 \
-  --cache-dir /kaggle/working/marble-cache \
-  -o /kaggle/working/draft_2s.mp4 --overwrite
+A atualização usa apenas fast-forward; não descarta alterações locais.
+
+```python
+from pathlib import Path
+import subprocess
+
+REPO = Path("/kaggle/working/musical-marble-generator")
+if not (REPO / ".git").exists():
+    subprocess.run([
+        "git", "clone",
+        "https://github.com/SrMikeJestic/musical-marble-generator.git", str(REPO)
+    ], check=True)
+else:
+    subprocess.run(["git", "-C", str(REPO), "pull", "--ff-only"], check=True)
+
+%cd /kaggle/working/musical-marble-generator
 ```
 
-Em uma música com pelo menos dois contatos nos primeiros dois segundos, o limite
-produz até 120 frames a 60 FPS, incluindo a cauda dentro dos dois segundos. O
-CLI só pula o Blender quando a sequência tem exatamente todos os frames esperados
-e nenhum PNG extra/inválido. Um frame ausente reativa a retomada; `--force` apaga
-os frames daquele job draft e força a reescrita, preservando os outros modos.
-As pastas e o número de frames válidos são mostrados no terminal. Para persistir
-entre sessões Kaggle, exporte/salve a pasta de cache junto com os outputs.
+### Célula 3 — Executar um único modo de teste
 
-O limite é absoluto, contado desde o início do MIDI, incluindo o silêncio inicial
-e a cauda sonora. O solver descarta notas posteriores antes de calcular os arcos;
-o JSON contém apenas os contatos e segmentos do trecho. O Blender cria somente
-suas plataformas/pinos e dimensiona a parede e a animação para esse trecho.
-O áudio também é filtrado antes da síntese. A duração final nunca excede o limite:
-é arredondada para baixo em frames completos a 60 FPS. Notas exatamente no limite
-continuam na matemática, mas não acrescentam um frame ao vídeo. O trecho precisa
-conter pelo menos dois contatos distintos. Sem `--max-duration`, a música inteira
-é processada como antes.
+Use `MODO = "test-frame"` para validar somente o frame 150. Para o teste de
+pipeline autorizado no Passo 0, troque para `MODO = "draft"`: serão processados
+apenas os primeiros dois segundos, com vídeo e áudio. Não execute vídeos
+inteiros como teste. O frame 150 é um exemplo: escolha um frame de impacto do seu
+MIDI e confirme que ele cabe no trecho solicitado.
 
-`--tail-seconds` ajusta a cauda (acima de 1 s, acrescenta silêncio) e `--descent`
-ajusta a descida visual. O uso independente da Fase 2 continua disponível:
-`blender --background --python src/blender_builder.py` salva `test_scene.blend`.
-O pipeline usa o mesmo builder com `--scene-json` e `--video-output` após `--`.
+```python
+import sys
+from IPython.display import Image, Video, display
 
-`src.audio_renderer.render_tts("Piano", "anuncio.mp3")` gera um anúncio separado
-via gTTS, que requer internet e envia o texto ao serviço. Essa função não é
-chamada pelo pipeline musical.
+MODO = "test-frame"  # Ou "draft", somente quando esse teste estiver autorizado.
+MIDI = Path("/kaggle/input/seu-dataset/musica.mid")  # Ajuste este caminho.
+FORCAR = False      # True refaz os frames do draft, ignorando o cache.
+Path("output").mkdir(exist_ok=True)
 
-```bash
-python -m unittest discover -s tests -v
-# Com SOUNDFONT definido, a suíte também verifica síntese real via FluidSynth.
-blender --background --python-exit-code 1 --python tests/blender_40_smoke.py
-# O teste de integração acima exige exatamente Blender 4.0.2 e GPU CUDA.
+comando = [sys.executable, "src/main.py", str(MIDI),
+           "--cache-dir", "output/marble-cache"]
+if MODO == "test-frame":
+    comando += ["--test-frame", "150", "--max-duration", "15",
+                "--resolution-percentage", "50",
+                "--test-output", "output/passo1_frame150.png"]
+elif MODO == "draft":
+    comando += ["--draft", "--seconds", "2", "--soundfont", os.environ["SOUNDFONT"],
+                "-o", "output/draft_2s.mp4", "--overwrite"]
+    if FORCAR:
+        comando.append("--force")
+else:
+    raise ValueError("Escolha apenas test-frame ou draft.")
+
+subprocess.run(comando, check=True)
+if MODO == "test-frame":
+    display(Image(filename="output/passo1_frame150.png"))
+else:
+    display(Video("output/draft_2s.mp4", embed=True))
 ```
+
+## Modos e cache
+
+| Modo | Resultado | Cache dentro de `output/marble-cache/` |
+| --- | --- | --- |
+| `--test-frame N` | Um PNG novo; não usa SoundFont nem FFmpeg | `test-frame/frame_<n>/` |
+| `--draft --seconds 2` | MP4 com áudio, até 270×480 e 16 samples, com denoising | `draft/<chave>/frames/` |
+| Final, sem `--draft` | Vídeo com áudio, até 1080×1920 e 64 samples | `final/<chave>/frames/` |
+
+`--seconds` é alias de `--max-duration`. Os argumentos `--test-frame`,
+`--max-duration`, `--resolution-percentage` e `--test-output` continuam válidos.
+O modo de um frame sempre ignora os frames antigos e substitui seu PNG de teste;
+`--draft` e `--test-frame` não devem ser combinados.
+
+O CLI só pula o Blender quando há exatamente a sequência de frames esperada,
+sem PNGs extras ou inválidos. Verifica dimensões, CRCs e os dados comprimidos dos
+PNGs. Frames concluídos são publicados por renomeação de `.png.part`; falhas ou
+interrupções preservam os frames válidos para retomada. A chave inclui os bytes
+do MIDI, o plano e o código da cena, inclusive câmera e materiais.
+
+`--force` refaz a sequência daquele job, preservando os outros caches. `--overwrite`
+autoriza substituir o MP4 de saída; são opções distintas. O limite temporal inclui
+a cauda sonora, preserva o silêncio inicial e não ultrapassa o número de segundos
+solicitado. São necessários pelo menos dois contatos distintos no trecho.
+
+O render exige CUDA e não faz fallback para CPU. Draft seleciona OptiX quando
+disponível e só usa OpenImageDenoise se o build o inclui; sem nenhum denoiser
+suportado, mostra um erro. Render final e teste de um frame mantêm denoising
+desativado. O compositor permanece desativado em todos os modos.
+
+## Destino seguro e governança
+
+Use `output/` para imagens, vídeos, áudio e caches. Essa convenção dos exemplos
+não muda os defaults existentes do CLI. Somente `output/.gitkeep` é versionado;
+seu conteúdo e os arquivos pesados de entrada/saída são bloqueados pelo
+`.gitignore`, inclusive frames, PNGs, MP4s, MIDI de teste e `marble-cache/`.
+Exporte ou salve os outputs do Kaggle para preservar resultados entre sessões.
+
+Cada passo autorizado deve ser entregue em um commit separado, com uma Git Tag
+própria, e aguardar aprovação antes do seguinte. O checklist usa `[ ] Pendente` e
+`[x] Concluído no commit XYZ`, conforme o estado definido pelo usuário. O marco
+de organização do Passo 0.5 recebe a tag `v0.5-org`. Não sobrescreva tags existentes.
+
+A física, o parser MIDI e a sincronização de áudio são somente leitura durante
+etapas visuais ou documentais. Este marco altera apenas organização e documentação:
+não executa renders, testes de código ou mudanças em arquivos `.py`.

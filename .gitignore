@@ -1,2 +1,30 @@
+# Resultados: somente o marcador da pasta deve ser versionado.
+/output/*
+!/output/.gitkeep
+
+# Sequências e caches de renderização, em qualquer nível.
 .marble-cache/
+marble-cache/
+frames/
+
+# Imagens, vídeos, áudio e dados de teste/entrada pesados.
+*.[pP][nN][gG]
+*.[mM][pP]4
+*.[mM][iI][dD]
+*.[mM][iI][dD][iI]
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.sf2
+*.sf3
+*.blend
+*.blend[0-9]*
+*.part
+
+# Arquivos locais do Python e do sistema.
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.DS_Store
