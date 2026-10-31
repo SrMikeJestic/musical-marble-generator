@@ -47,7 +47,7 @@ def _parser() -> argparse.ArgumentParser:
                         help="Limita notas, geometria, vídeo e áudio aos primeiros N segundos")
     parser.add_argument("--resolution-percentage", type=int, default=100,
                         help="Escala de 1 a 100; use 10 para uma prévia rápida")
-    parser.add_argument("--render-samples", type=int, default=64, help="Amostras EEVEE por frame")
+    parser.add_argument("--render-samples", type=int, default=64, help="Amostras Cycles por frame (máximo 64)")
     parser.add_argument("--overwrite", action="store_true", help="Permite substituir a saída existente")
     return parser
 

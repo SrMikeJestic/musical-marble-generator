@@ -3,13 +3,17 @@
 Gerador headless de vídeos musicais 3D em 9:16, com cinemática determinística
 dirigida por MIDI. Não usa Rigid Body.
 
-Requer Python 3.10+, Blender 4.0.2 com EEVEE clássico e suporte H.264, FFmpeg, a biblioteca
+Requer Python 3.10+, Blender 4.0.2 com Cycles CUDA e suporte H.264, FFmpeg, a biblioteca
 nativa FluidSynth e uma SoundFont General MIDI `.sf2` fornecida pelo usuário.
 No Debian/Ubuntu, os pacotes `blender`, `ffmpeg`, `libfluidsynth3` e
 `fluid-soundfont-gm` fornecem as ferramentas e uma SoundFont; confirme que a
 versão instalada do Blender é 4.0.2, como no ambiente Google Colab deste projeto.
-O builder usa transparência por shader para aproximar vidro translúcido, sem
-refração óptica ou rastreamento de raios. Usa as APIs do EEVEE clássico.
+No Colab, selecione um runtime com GPU NVIDIA. O builder exige CUDA, ativa somente
+as GPUs CUDA nas preferências do Cycles e define `scene.cycles.device = 'GPU'`.
+Se CUDA ou a GPU não estiverem disponíveis, o script encerra com erro antes de
+construir a geometria. Não há fallback para CPU. O máximo é de 64 samples por
+frame; `--render-samples` permite menos amostras para prévias e valores maiores
+são limitados a 64. O vidro mantém a aproximação translúcida por shader.
 
 ```bash
 python -m venv .venv
@@ -72,5 +76,5 @@ chamada pelo pipeline musical.
 python -m unittest discover -s tests -v
 # Com SOUNDFONT definido, a suíte também verifica síntese real via FluidSynth.
 blender --background --python-exit-code 1 --python tests/blender_40_smoke.py
-# O teste de integração acima exige exatamente Blender 4.0.2.
+# O teste de integração acima exige exatamente Blender 4.0.2 e GPU CUDA.
 ```

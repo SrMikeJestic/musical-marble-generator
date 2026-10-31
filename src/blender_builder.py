@@ -1,6 +1,6 @@
-"""Constrói e anima uma cena EEVEE inteiramente procedural, sem Rigid Body.
+"""Constrói e anima uma cena Cycles CUDA inteiramente procedural, sem Rigid Body.
 
-Execute da raiz do projeto com Blender 4.0.2 (EEVEE clássico)::
+Execute da raiz do projeto com Blender 4.0.2 e uma GPU NVIDIA CUDA disponível::
 
     blender --background --python src/blender_builder.py
 
@@ -42,6 +42,7 @@ BALL_RADIUS = 0.16
 WALL_Y = 1.4
 PLATFORM_DEPTH = 0.8
 PLATFORM_THICKNESS = 0.18
+MAX_RENDER_SAMPLES = 64
 PALETTE = (
     (0.95, 0.20, 0.16, 1.0),
     (1.00, 0.61, 0.10, 1.0),
@@ -49,6 +50,37 @@ PALETTE = (
     (0.18, 0.44, 0.85, 1.0),
     (0.60, 0.28, 0.78, 1.0),
 )
+
+
+def configure_cycles_gpu(scene: bpy.types.Scene, samples: int = MAX_RENDER_SAMPLES) -> None:
+    """Exige CUDA, desativa CPU e limita o Cycles a no máximo 64 samples."""
+    if not isinstance(samples, int) or samples < 1:
+        raise ValueError("O número de amostras deve ser um inteiro positivo.")
+    if "cycles" not in bpy.context.preferences.addons:
+        bpy.ops.preferences.addon_enable(module="cycles")
+    if "cycles" not in bpy.context.preferences.addons:
+        raise RuntimeError("O Blender precisa ter o addon Cycles disponível.")
+    scene.render.engine = "CYCLES"
+    preferences = bpy.context.preferences.addons["cycles"].preferences
+    try:
+        preferences.compute_device_type = "CUDA"
+        cuda_devices = [
+            device for device in preferences.get_devices_for_type("CUDA") if device.type == "CUDA"
+        ]
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise RuntimeError("Cycles CUDA indisponível. Ative uma GPU NVIDIA no runtime do Colab.") from exc
+
+    # Preferências salvas podem conter GPUs de outra sessão. Ative somente IDs
+    # detectados agora, excluindo CPU, outros backends e dispositivos antigos.
+    available_ids = {device.id for device in cuda_devices}
+    for device in preferences.devices:
+        device.use = device.type == "CUDA" and device.id in available_ids
+    if not cuda_devices:
+        raise RuntimeError("Nenhuma GPU CUDA detectada pelo Cycles. Ative uma GPU NVIDIA no Colab.")
+    scene.cycles.device = "GPU"
+    scene.cycles.samples = min(samples, MAX_RENDER_SAMPLES)
+    names = ", ".join(device.name for device in cuda_devices)
+    print(f"Cycles CUDA: {names}; máximo de {scene.cycles.samples} samples.", flush=True)
 
 
 def create_pbr_material(
@@ -59,10 +91,10 @@ def create_pbr_material(
     roughness: float = 0.5,
     transmission: float = 0.0,
 ) -> bpy.types.Material:
-    """Material PBR do EEVEE 4.0.2, com transparência de superfície para vidro.
+    """Material PBR do Blender 4.0.2, com transparência de superfície para vidro.
 
     ``transmission`` mistura o Principled com Transparent BSDF, aproximando
-    vidro translúcido sem refração óptica ou rastreamento de raios.
+    vidro translúcido sem refração óptica.
     """
     material = bpy.data.materials.new(name)
     material.use_nodes = True
@@ -82,9 +114,6 @@ def create_pbr_material(
         material.node_tree.links.new(shader.outputs["BSDF"], mix.inputs[1])
         material.node_tree.links.new(transparent.outputs["BSDF"], mix.inputs[2])
         material.node_tree.links.new(mix.outputs[0], output.inputs["Surface"])
-        material.blend_method = "BLEND"
-        material.shadow_method = "HASHED"
-        material.show_transparent_back = False
     else:
         material.node_tree.links.new(shader.outputs["BSDF"], output.inputs["Surface"])
     return material
@@ -173,6 +202,7 @@ def build_scene(
     segments: Iterable[TrajectorySegment] | None = None,
     frame_end: int | None = None,
     max_duration: float | None = None,
+    render_samples: int = MAX_RENDER_SAMPLES,
 ) -> bpy.types.Scene:
     """Limpa a cena ativa e constrói o layout a partir de timestamps em segundos.
 
@@ -182,6 +212,7 @@ def build_scene(
     calculada no JSON; ``frame_end`` inclui a duração das notas e a cauda sonora.
     ``max_duration`` descarta contatos e segmentos posteriores ao limite antes
     de construir qualquer geometria e limita também o intervalo de renderização.
+    ``render_samples`` limita as amostras do Cycles CUDA a no máximo 64 por frame.
     Nenhum corpo rígido é criado.
     """
     if not math.isfinite(descent) or descent < 0:
@@ -208,12 +239,10 @@ def build_scene(
     if frame_end is not None and (not isinstance(frame_end, int) or frame_end < minimum_frame_end):
         raise ValueError("O frame final precisa incluir todos os contatos.")
     scene = bpy.context.scene
+    configure_cycles_gpu(scene, render_samples)
     for obj in list(scene.objects):
         bpy.data.objects.remove(obj, do_unlink=True)
 
-    scene.render.engine = "BLENDER_EEVEE"
-    scene.eevee.use_ssr = False
-    scene.eevee.use_ssr_refraction = False
     scene.render.fps = FPS
     scene.render.fps_base = 1.0
     scene.render.resolution_x = RESOLUTION_X
@@ -341,6 +370,7 @@ def render_scene_plan(plan_path: Path, video_path: Path) -> None:
         segments=[TrajectorySegment(**segment) for segment in plan["segments"]],
         frame_end=plan["frame_end"],
         max_duration=plan.get("max_duration"),
+        render_samples=samples,
     )
     # H.264 exige dimensões pares. Múltiplos de 18x32 preservam também o 9:16
     # em escalas pequenas, cuja porcentagem pode produzir dimensões ímpares.
@@ -348,7 +378,6 @@ def render_scene_plan(plan_path: Path, video_path: Path) -> None:
     scene.render.resolution_x = 9 * scale_unit
     scene.render.resolution_y = 16 * scale_unit
     scene.render.resolution_percentage = 100
-    scene.eevee.taa_render_samples = samples
     scene.render.image_settings.file_format = "FFMPEG"
     scene.render.ffmpeg.format = "MPEG4"
     scene.render.ffmpeg.codec = "H264"
