@@ -14,6 +14,9 @@ Se CUDA ou a GPU não estiverem disponíveis, o script encerra com erro antes de
 construir a geometria. Não há fallback para CPU. O máximo é de 64 samples por
 frame; `--render-samples` permite menos amostras para prévias e valores maiores
 são limitados a 64. O vidro mantém a aproximação translúcida por shader.
+O denoising de render, prévia e camadas é desativado explicitamente, assim como
+os passes auxiliares de denoising e o compositor, para suportar builds sem
+OpenImageDenoise. Não é necessário instalar nem selecionar um denoiser.
 
 ```bash
 python -m venv .venv

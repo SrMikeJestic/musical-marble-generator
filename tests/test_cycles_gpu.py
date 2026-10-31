@@ -30,7 +30,23 @@ class CyclesGpuTests(unittest.TestCase):
         self.builder = importlib.util.module_from_spec(spec)
         with patch.dict(sys.modules, {"bpy": self.bpy, "mathutils": NS(Vector=object)}):
             spec.loader.exec_module(self.builder)
-        self.scene = NS(render=NS(engine=""), cycles=NS(device="CPU", samples=4096))
+        self.scene = NS(
+            render=NS(engine="", use_compositing=True),
+            cycles=NS(device="CPU", samples=4096, use_denoising=True, use_preview_denoising=True),
+            view_layers=[
+                NS(cycles=NS(use_denoising=True, denoising_store_passes=True)) for _ in range(2)
+            ],
+            use_nodes=True,
+        )
+
+    def test_denoising_is_disabled_for_render_preview_layers_and_compositor(self):
+        self.builder.configure_cycles_gpu(self.scene)
+        self.assertFalse(self.scene.cycles.use_denoising)
+        self.assertFalse(self.scene.cycles.use_preview_denoising)
+        self.assertTrue(all(not layer.cycles.use_denoising for layer in self.scene.view_layers))
+        self.assertTrue(all(not layer.cycles.denoising_store_passes for layer in self.scene.view_layers))
+        self.assertFalse(self.scene.use_nodes)
+        self.assertFalse(self.scene.render.use_compositing)
 
     def test_only_current_cuda_devices_are_enabled(self):
         self.builder.configure_cycles_gpu(self.scene)

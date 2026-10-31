@@ -52,6 +52,19 @@ PALETTE = (
 )
 
 
+def disable_denoising(scene: bpy.types.Scene) -> None:
+    """Dispensa denoisers no Blender 4.0.2, inclusive builds sem OpenImageDenoise."""
+    scene.cycles.use_denoising = False
+    scene.cycles.use_preview_denoising = False
+    for layer in scene.view_layers:
+        layer.cycles.use_denoising = False
+        layer.cycles.denoising_store_passes = False
+    # Ignora também árvores de composição herdadas do arquivo de inicialização,
+    # inclusive nós Denoise dentro de grupos. Nenhum compositor será executado.
+    scene.use_nodes = False
+    scene.render.use_compositing = False
+
+
 def configure_cycles_gpu(scene: bpy.types.Scene, samples: int = MAX_RENDER_SAMPLES) -> None:
     """Exige CUDA, desativa CPU e limita o Cycles a no máximo 64 samples."""
     if not isinstance(samples, int) or samples < 1:
@@ -61,6 +74,7 @@ def configure_cycles_gpu(scene: bpy.types.Scene, samples: int = MAX_RENDER_SAMPL
     if "cycles" not in bpy.context.preferences.addons:
         raise RuntimeError("O Blender precisa ter o addon Cycles disponível.")
     scene.render.engine = "CYCLES"
+    disable_denoising(scene)
     preferences = bpy.context.preferences.addons["cycles"].preferences
     try:
         preferences.compute_device_type = "CUDA"
@@ -387,6 +401,7 @@ def render_scene_plan(plan_path: Path, video_path: Path) -> None:
     video_path = video_path.expanduser().resolve()
     video_path.parent.mkdir(parents=True, exist_ok=True)
     scene.render.filepath = str(video_path)
+    disable_denoising(scene)
     bpy.ops.render.render(animation=True)
 
 

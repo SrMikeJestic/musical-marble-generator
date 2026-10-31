@@ -58,6 +58,11 @@ def main() -> None:
         assert scene.render.engine == "CYCLES"
         assert scene.cycles.device == "GPU"
         assert scene.cycles.samples == 8
+        assert not scene.cycles.use_denoising
+        assert not scene.cycles.use_preview_denoising
+        assert all(not layer.cycles.use_denoising for layer in scene.view_layers)
+        assert all(not layer.cycles.denoising_store_passes for layer in scene.view_layers)
+        assert not scene.use_nodes and not scene.render.use_compositing
         preferences = bpy.context.preferences.addons["cycles"].preferences
         assert preferences.compute_device_type == "CUDA"
         assert any(device.type == "CUDA" and device.use for device in preferences.devices)
