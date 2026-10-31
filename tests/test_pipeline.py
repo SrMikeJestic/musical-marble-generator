@@ -70,6 +70,106 @@ class PipelineTests(unittest.TestCase):
             with self.subTest(note_count=note_count), self.assertRaises(ValueError):
                 parse_midi(self.midi)
 
+    def test_solver_discards_later_notes_before_calculating_positions(self):
+        times = [i * 0.5 for i in range(1601)]
+        limited = solve_layout(iter(times), max_duration=15.0)
+        self.assertEqual(len(limited), 30)
+        self.assertEqual(len(solve_layout(times)), 1600)
+        self.assertEqual(limited, solve_layout(times[:31]))
+        self.assertEqual(limited[-1].end_time, 15.0)
+        for value in (0, -1, float("nan"), float("inf")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                solve_layout(times, max_duration=value)
+        with self.assertRaises(ValueError):
+            solve_layout([0.0, 16.0], max_duration=15.0)
+
+    @patch("src.main.ctypes.util.find_library", return_value="libfluidsynth.so.3")
+    @patch("src.main.shutil.which", side_effect=lambda name: f"/usr/bin/{name}")
+    def test_long_midi_json_only_contains_first_fifteen_seconds(self, *_):
+        midi = pretty_midi.PrettyMIDI(resolution=960)
+        part = pretty_midi.Instrument(0)
+        part.notes = [pretty_midi.Note(100, 60, i * 0.5, i * 0.5 + 0.2) for i in range(1601)]
+        midi.instruments.append(part)
+        midi.write(str(self.midi))
+        original_midi = self.midi.read_bytes()
+
+        def render_limited(command, **kwargs):
+            if "--scene-json" in command:
+                plan_path = Path(command[command.index("--scene-json") + 1])
+                plan = json.loads(plan_path.read_text())
+                self.assertEqual(plan["max_duration"], 15.0)
+                self.assertEqual(plan["timestamps"], [i * 0.5 for i in range(31)])
+                self.assertEqual(len(plan["segments"]), 30)
+                self.assertEqual(plan["segments"][-1]["end_time"], 15.0)
+                self.assertEqual(plan["frame_end"], 900)
+                self.assertLess(plan_path.stat().st_size, 12_000)
+                Path(command[command.index("--video-output") + 1]).write_bytes(b"short video")
+            else:
+                self.assertEqual(command[command.index("-t") + 1], "15.000000000")
+                Path(command[-1]).write_bytes(b"short final")
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch("src.main.subprocess.run", side_effect=render_limited), patch(
+            "src.main.render_midi_audio"
+        ) as audio:
+            run_pipeline(self.args("--max-duration", "15"))
+            self.assertEqual(audio.call_args.kwargs["duration"], 15.0)
+        self.assertEqual(self.midi.read_bytes(), original_midi)
+        self.assertEqual(list(self.root.glob("marble-*")), [])
+
+    @patch("src.main.ctypes.util.find_library", return_value="libfluidsynth.so.3")
+    @patch("src.main.shutil.which", side_effect=lambda name: f"/usr/bin/{name}")
+    def test_duration_cap_rounds_down_and_includes_boundary_contact(self, *_):
+        for limit, expected_frames in ((1.01, 60), (0.75, 45)):
+            def render_limited(command, **kwargs):
+                if "--scene-json" in command:
+                    plan = json.loads(Path(command[command.index("--scene-json") + 1]).read_text())
+                    self.assertEqual(plan["timestamps"], [0.125, 0.75])
+                    self.assertEqual(plan["frame_end"], expected_frames)
+                    Path(command[command.index("--video-output") + 1]).write_bytes(b"video")
+                else:
+                    self.assertEqual(command[command.index("-t") + 1], f"{expected_frames / 60:.9f}")
+                    Path(command[-1]).write_bytes(b"final")
+                return subprocess.CompletedProcess(command, 0)
+
+            with self.subTest(limit=limit), patch("src.main.subprocess.run", side_effect=render_limited), patch(
+                "src.main.render_midi_audio"
+            ) as audio:
+                run_pipeline(self.args("--max-duration", str(limit), "--overwrite"))
+                self.assertEqual(audio.call_args.kwargs["duration"], expected_frames / 60)
+
+    @patch("src.main.ctypes.util.find_library", return_value="libfluidsynth.so.3")
+    @patch("src.main.shutil.which", side_effect=lambda name: f"/usr/bin/{name}")
+    def test_short_or_invalid_limit_fails_before_starting_blender(self, *_):
+        for limit in ("0.5", "0", "-1", "nan", "inf", "0.001"):
+            with self.subTest(limit=limit), patch("src.main.subprocess.run") as run, self.assertRaises(ValueError):
+                run_pipeline(self.args("--max-duration", limit))
+            run.assert_not_called()
+        self.assertEqual(list(self.root.glob("marble-*")), [])
+
+    def test_audio_filters_events_before_synthesis(self):
+        midi = pretty_midi.PrettyMIDI()
+        part = pretty_midi.Instrument(0)
+        part.notes = [pretty_midi.Note(100, 60, 0, 10), pretty_midi.Note(100, 67, 20, 21)]
+        part.control_changes = [pretty_midi.ControlChange(7, 100, 0), pretty_midi.ControlChange(7, 50, 20)]
+        part.pitch_bends = [pretty_midi.PitchBend(100, 0), pretty_midi.PitchBend(200, 20)]
+        midi.instruments.append(part)
+        midi.write(str(self.midi))
+        original_midi = self.midi.read_bytes()
+
+        def synthesize_excerpt(midi, **kwargs):
+            self.assertEqual(len(midi.instruments), 1)
+            notes = midi.instruments[0].notes
+            self.assertEqual(len(notes), 1)
+            self.assertEqual((notes[0].start, notes[0].end), (0, 1))
+            self.assertEqual(len(midi.instruments[0].control_changes), 1)
+            self.assertEqual(len(midi.instruments[0].pitch_bends), 1)
+            return np.ones(48_000) * 0.2
+
+        with patch.object(pretty_midi.PrettyMIDI, "fluidsynth", autospec=True, side_effect=synthesize_excerpt):
+            render_midi_audio(self.midi, self.soundfont, self.root / "limited.wav", duration=1.0)
+        self.assertEqual(self.midi.read_bytes(), original_midi)
+
     def test_wav_precision_duration_and_silence(self):
         output = self.root / "audio.wav"
         samples = np.concatenate((np.zeros(6000), np.ones(6000) * 0.25))
@@ -122,6 +222,15 @@ class PipelineTests(unittest.TestCase):
 
     @patch("src.main.ctypes.util.find_library", return_value="libfluidsynth.so.3")
     @patch("src.main.shutil.which", side_effect=lambda name: f"/usr/bin/{name}")
+    def test_limit_does_not_extend_a_short_song(self, *_):
+        with patch("src.main.subprocess.run", side_effect=self.fake_run), patch(
+            "src.main.render_midi_audio"
+        ) as audio:
+            run_pipeline(self.args("--max-duration", "15"))
+            self.assertEqual(audio.call_args.kwargs["duration"], 2.25)
+
+    @patch("src.main.ctypes.util.find_library", return_value="libfluidsynth.so.3")
+    @patch("src.main.shutil.which", side_effect=lambda name: f"/usr/bin/{name}")
     def test_failure_cleans_temporary_files_and_preserves_existing_output(self, *_):
         self.output.write_bytes(b"previous video")
         with patch("src.main.subprocess.run", side_effect=self.fake_run), patch(
@@ -171,6 +280,28 @@ class PipelineTests(unittest.TestCase):
         audio, _ = sf.read(str(output))
         self.assertGreater(float(np.max(np.abs(audio[6000:]))), 0.1)
         self.assertLess(float(np.max(np.abs(audio[:5000]))), 0.001)
+
+    @unittest.skipUnless(os.environ.get("SOUNDFONT"), "Defina SOUNDFONT para testar síntese real")
+    def test_real_fluidsynth_only_synthesizes_excerpt_of_long_midi(self):
+        midi = pretty_midi.PrettyMIDI(resolution=960)
+        part = pretty_midi.Instrument(0)
+        part.notes = [pretty_midi.Note(100, 60, i * 0.5, i * 0.5 + 0.2) for i in range(1601)]
+        midi.instruments.append(part)
+        midi.write(str(self.midi))
+        original_synth = pretty_midi.PrettyMIDI.fluidsynth
+
+        def synthesize_excerpt(midi, **kwargs):
+            notes = [note for part in midi.instruments for note in part.notes]
+            # A nota em 15 s é uma âncora visual; seu som começaria após o corte.
+            self.assertEqual(len(notes), 30)
+            self.assertTrue(all(note.start < 15 and note.end <= 15 for note in notes))
+            return original_synth(midi, **kwargs)
+
+        output = self.root / "real_excerpt.wav"
+        with patch.object(pretty_midi.PrettyMIDI, "fluidsynth", autospec=True, side_effect=synthesize_excerpt):
+            render_midi_audio(self.midi, os.environ["SOUNDFONT"], output, duration=15)
+        info = sf.info(str(output))
+        self.assertEqual((info.frames, info.samplerate, info.subtype), (720_000, 48_000, "PCM_24"))
 
 
 if __name__ == "__main__":

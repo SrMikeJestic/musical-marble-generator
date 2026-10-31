@@ -20,7 +20,8 @@ def render_midi_audio(
 
     pretty_midi/FluidSynth respeita instrumentos, velocidades, controles e pitch
     bends e fornece um segundo de cauda após os últimos eventos. ``duration``
-    pode recortar essa cauda ou estender com silêncio para coincidir com o vídeo;
+    filtra notas/eventos antes da síntese e pode recortar essa cauda ou estender
+    com silêncio para coincidir com o vídeo;
     o silêncio inicial do MIDI é mantido. Não abre dispositivo de áudio.
     Requer a biblioteca nativa libfluidsynth, além dos pacotes Python.
     """
@@ -38,6 +39,16 @@ def render_midi_audio(
         raise ValueError("A duração deve ser finita e positiva.")
 
     midi = pretty_midi.PrettyMIDI(str(midi_path))
+    if duration is not None:
+        # Evita sintetizar uma música inteira para exportar somente uma prévia.
+        # Notas já em execução são preservadas até o corte. O arquivo não muda.
+        for part in midi.instruments:
+            part.notes = [note for note in part.notes if note.start < duration]
+            for note in part.notes:
+                note.end = min(note.end, duration)
+            part.control_changes = [event for event in part.control_changes if event.time < duration]
+            part.pitch_bends = [event for event in part.pitch_bends if event.time < duration]
+        midi.instruments = [part for part in midi.instruments if part.notes]
     if not any(part.notes for part in midi.instruments):
         raise ValueError("O MIDI não contém notas para sintetizar.")
     audio = midi.fluidsynth(fs=sample_rate, synthesizer=str(soundfont_path), normalize=False)

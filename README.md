@@ -26,7 +26,7 @@ O CLI interpreta mudanças de andamento, agrupa notas simultâneas em um contato
 da bolinha e calcula os arcos com o solver. Em seguida, entrega um JSON ao Blender,
 renderiza MP4/H.264 a 1080×1920 e 60 FPS, sintetiza WAV mono PCM de 24 bits a
 48 kHz com FluidSynth e combina vídeo e áudio AAC de 320 kb/s pelo FFmpeg.
-Todas as notas e instrumentos do MIDI original permanecem no áudio.
+Sem limite de duração, todas as notas e instrumentos do MIDI original permanecem no áudio.
 
 Os tempos são absolutos: a nota em `t` corresponde ao frame `1 + 60*t`.
 Contatos entre frames inteiros mantêm chaves fracionárias. O silêncio inicial é
@@ -42,6 +42,22 @@ Para uma prévia rápida, reduza resolução e amostras:
 python src/main.py input.mid --soundfont instrumento.sf2 --resolution-percentage 10 --render-samples 1
 python src/main.py --help
 ```
+
+Para limitar uma música longa aos primeiros 15 segundos:
+
+```bash
+python src/main.py input.mid --soundfont instrumento.sf2 --max-duration 15
+```
+
+O limite é absoluto, contado desde o início do MIDI, incluindo o silêncio inicial
+e a cauda sonora. O solver descarta notas posteriores antes de calcular os arcos;
+o JSON contém apenas os contatos e segmentos do trecho. O Blender cria somente
+suas plataformas/pinos e dimensiona a parede e a animação para esse trecho.
+O áudio também é filtrado antes da síntese. A duração final nunca excede o limite:
+é arredondada para baixo em frames completos a 60 FPS. Notas exatamente no limite
+continuam na matemática, mas não acrescentam um frame ao vídeo. O trecho precisa
+conter pelo menos dois contatos distintos. Sem `--max-duration`, a música inteira
+é processada como antes.
 
 `--tail-seconds` ajusta a cauda (acima de 1 s, acrescenta silêncio) e `--descent`
 ajusta a descida visual. O uso independente da Fase 2 continua disponível:

@@ -43,6 +43,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--descent", type=float, default=0.35, help="Queda em Z por metro em X")
     parser.add_argument("--tail-seconds", type=float, default=1.0,
                         help="Tempo após o fim do MIDI; acima de 1 s acrescenta silêncio")
+    parser.add_argument("--max-duration", type=float,
+                        help="Limita notas, geometria, vídeo e áudio aos primeiros N segundos")
     parser.add_argument("--resolution-percentage", type=int, default=100,
                         help="Escala de 1 a 100; use 10 para uma prévia rápida")
     parser.add_argument("--render-samples", type=int, default=64, help="Amostras EEVEE por frame")
@@ -68,6 +70,10 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         raise ValueError("--descent deve ser finito e não negativo.")
     if not math.isfinite(args.tail_seconds) or args.tail_seconds < 0:
         raise ValueError("--tail-seconds deve ser finito e não negativo.")
+    if args.max_duration is not None and (
+        not math.isfinite(args.max_duration) or args.max_duration < 1 / FPS
+    ):
+        raise ValueError(f"--max-duration deve ser finito e permitir pelo menos um frame ({1 / FPS:.6f} s).")
     if not 1 <= args.resolution_percentage <= 100 or args.render_samples < 1:
         raise ValueError("Use resolução entre 1 e 100 e pelo menos uma amostra.")
     blender = shutil.which(args.blender)
@@ -79,12 +85,19 @@ def run_pipeline(args: argparse.Namespace) -> Path:
 
     print("A: Interpretando MIDI e calculando trajetórias...", flush=True)
     timeline = parse_midi(midi_path)
-    arcs = solve_layout(timeline.timestamps)
+    arcs = solve_layout(timeline.timestamps, max_duration=args.max_duration)
+    timestamps = (arcs[0].start_time, *(arc.end_time for arc in arcs))
     frame_count = max(
         math.ceil((timeline.end_time + args.tail_seconds) * FPS),
-        math.ceil(timeline.timestamps[-1] * FPS) + 1,
+        math.ceil(timestamps[-1] * FPS) + 1,
     )
+    if args.max_duration is not None and args.max_duration < frame_count / FPS:
+        # Frames completos: a duração codificada nunca ultrapassa o limite.
+        frame_count = math.floor(args.max_duration * FPS)
     duration = frame_count / FPS
+    if timestamps[0] >= duration:
+        raise ValueError("O limite não contém notas antes do fim dos frames completos do vídeo.")
+    print(f"Plano: {len(timestamps)} contatos, {frame_count} frames, {duration:.3f} s.", flush=True)
     output.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix="marble-", dir=output.parent) as directory:
         work = Path(directory)
@@ -95,12 +108,13 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         plan = {
             "schema_version": 1,
             "fps": FPS,
-            "timestamps": timeline.timestamps,
+            "timestamps": timestamps,
             "segments": [asdict(arc) for arc in arcs],
             "frame_end": frame_count,
             "descent": args.descent,
             "resolution_percentage": args.resolution_percentage,
             "render_samples": args.render_samples,
+            "max_duration": args.max_duration,
         }
         plan_path.write_text(json.dumps(plan, ensure_ascii=False, allow_nan=False), encoding="utf-8")
 

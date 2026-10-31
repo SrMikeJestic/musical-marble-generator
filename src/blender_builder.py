@@ -172,6 +172,7 @@ def build_scene(
     descent: float = 0.35,
     segments: Iterable[TrajectorySegment] | None = None,
     frame_end: int | None = None,
+    max_duration: float | None = None,
 ) -> bpy.types.Scene:
     """Limpa a cena ativa e constrói o layout a partir de timestamps em segundos.
 
@@ -179,15 +180,31 @@ def build_scene(
     acompanha X e a descida de base em Z, sem copiar os saltos verticais; uma
     constraint mantém a esfera enquadrada. ``segments`` recebe a matemática já
     calculada no JSON; ``frame_end`` inclui a duração das notas e a cauda sonora.
+    ``max_duration`` descarta contatos e segmentos posteriores ao limite antes
+    de construir qualquer geometria e limita também o intervalo de renderização.
     Nenhum corpo rígido é criado.
     """
     if not math.isfinite(descent) or descent < 0:
         raise ValueError("A inclinação deve ser finita e não negativa.")
+    if max_duration is not None and (
+        not math.isfinite(max_duration) or max_duration < 1 / FPS
+    ):
+        raise ValueError("A duração máxima deve ser finita e permitir pelo menos um frame.")
     times = tuple(timestamps)
-    arcs = list(segments) if segments is not None else solve_layout(times)
+    arcs = list(segments) if segments is not None else solve_layout(times, max_duration=max_duration)
+    if max_duration is not None:
+        times = tuple(t for t in times if t <= max_duration)
+        arcs = [arc for arc in arcs if arc.end_time <= max_duration]
     if not arcs or (arcs[0].start_time, *(arc.end_time for arc in arcs)) != times:
         raise ValueError("Os segmentos devem corresponder aos timestamps do plano.")
     minimum_frame_end = math.ceil(arcs[-1].end_time * FPS) + 1
+    if max_duration is not None:
+        # O contato no instante exato do corte pode ter uma chave logo após o
+        # último frame renderizado. Ela ancora o arco, sem acrescentar vídeo.
+        max_frame_end = math.floor(max_duration * FPS)
+        minimum_frame_end = min(minimum_frame_end, max_frame_end)
+        if isinstance(frame_end, int):
+            frame_end = min(frame_end, max_frame_end)
     if frame_end is not None and (not isinstance(frame_end, int) or frame_end < minimum_frame_end):
         raise ValueError("O frame final precisa incluir todos os contatos.")
     scene = bpy.context.scene
@@ -323,6 +340,7 @@ def render_scene_plan(plan_path: Path, video_path: Path) -> None:
         plan["timestamps"], descent=plan["descent"],
         segments=[TrajectorySegment(**segment) for segment in plan["segments"]],
         frame_end=plan["frame_end"],
+        max_duration=plan.get("max_duration"),
     )
     # H.264 exige dimensões pares. Múltiplos de 18x32 preservam também o 9:16
     # em escalas pequenas, cuja porcentagem pode produzir dimensões ímpares.

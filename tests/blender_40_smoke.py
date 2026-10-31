@@ -16,7 +16,7 @@ from pathlib import Path
 import bpy
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.blender_builder import BALL_RADIUS, render_scene_plan
+from src.blender_builder import BALL_RADIUS, build_scene, render_scene_plan
 from src.layout_solver import solve_layout
 
 
@@ -25,18 +25,26 @@ def main() -> None:
         raise RuntimeError(f"Este teste exige Blender 4.0.2; encontrado: {bpy.app.version_string}")
 
     times = [0.0, 0.025, 0.05]
-    arcs = solve_layout(times)
+    # Um JSON antigo pode conter a música inteira; o builder também deve filtrar
+    # antes de instanciar os mais de 1600 contatos fora da prévia.
+    full_times = times + [float(i) for i in range(1, 1602)]
+    arcs = solve_layout(full_times)
+    scene = build_scene(full_times, segments=arcs, frame_end=5, max_duration=0.05)
+    assert scene.frame_end == 3
+    assert len([obj for obj in scene.objects if obj.name.startswith("Platform_")]) == 3
+    assert len([obj for obj in scene.objects if obj.name.startswith("Pin_")]) == 3
     with tempfile.TemporaryDirectory(prefix="blender-40-smoke-") as directory:
         root = Path(directory)
         plan = {
             "schema_version": 1,
             "fps": 60,
-            "timestamps": times,
+            "timestamps": full_times,
             "segments": [asdict(arc) for arc in arcs],
             "frame_end": 5,
             "descent": 0.35,
             "resolution_percentage": 10,
             "render_samples": 8,
+            "max_duration": 0.05,
         }
         plan_path = root / "scene.json"
         plan_path.write_text(json.dumps(plan), encoding="utf-8")
@@ -44,6 +52,9 @@ def main() -> None:
         render_scene_plan(plan_path, video_path)
         assert video_path.is_file() and video_path.stat().st_size > 0
         scene = bpy.context.scene
+        assert scene.frame_end == 3
+        assert len([obj for obj in scene.objects if obj.name.startswith("Platform_")]) == 3
+        assert len([obj for obj in scene.objects if obj.name.startswith("Pin_")]) == 3
         assert scene.render.engine == "BLENDER_EEVEE"
         assert not scene.eevee.use_ssr and not scene.eevee.use_ssr_refraction
         assert (scene.render.resolution_x, scene.render.resolution_y) == (108, 192)

@@ -69,6 +69,7 @@ def solve_layout(
     gravity: float = GRAVITY,
     start_x: float = 0.0,
     platform_z: float = PLATFORM_Z,
+    max_duration: float | None = None,
 ) -> list[TrajectorySegment]:
     """Gera N-1 arcos e determina as N posições de contato a partir das notas.
 
@@ -80,14 +81,22 @@ def solve_layout(
     Velocidade horizontal e gravidade devem ser finitas e positivas. A primeira
     plataforma fica em (start_x, platform_z); cada arco expõe suas posições
     inicial e final para a construção posterior das plataformas.
+
+    ``max_duration`` limita os tempos absolutos desde o início do MIDI. Descarta
+    contatos posteriores ao limite antes de calcular posições e arcos; um contato
+    exatamente no limite é mantido. Ainda são necessários dois contatos no trecho.
     """
     times = list(timestamps)
-    if len(times) < 2:
-        raise ValueError("Forneça pelo menos dois timestamps.")
+    if max_duration is not None and (not isfinite(max_duration) or max_duration <= 0):
+        raise ValueError("A duração máxima deve ser finita e positiva.")
     if any(not isfinite(t) or t < 0 for t in times):
         raise ValueError("Os timestamps devem ser finitos e não negativos.")
     if any(end <= start for start, end in zip(times, times[1:])):
         raise ValueError("Os timestamps devem ser estritamente crescentes.")
+    if max_duration is not None:
+        times = [t for t in times if t <= max_duration]
+    if len(times) < 2:
+        raise ValueError("Forneça pelo menos dois timestamps dentro do limite de duração.")
     if not isfinite(horizontal_speed) or horizontal_speed <= 0:
         raise ValueError("A velocidade horizontal deve ser finita e positiva.")
     if not isfinite(gravity) or gravity <= 0:
