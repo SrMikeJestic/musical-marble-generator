@@ -103,6 +103,38 @@ def configure_cycles_gpu(scene: bpy.types.Scene, samples: int = MAX_RENDER_SAMPL
     print(f"Cycles CUDA: {names}; máximo de {scene.cycles.samples} samples.", flush=True)
 
 
+def enable_draft_denoising(scene: bpy.types.Scene) -> None:
+    """Seleciona um denoiser nativo disponível, sem assumir suporte a OIDN."""
+    import _cycles
+
+    disable_denoising(scene)
+    preferences = bpy.context.preferences.addons["cycles"].preferences
+    try:
+        optix_devices = preferences.get_devices_for_type("OPTIX")
+    except (RuntimeError, ValueError, TypeError):
+        optix_devices = []
+    # Enumerar OptiX pode criar novas entradas ativadas nas preferências. Elas
+    # servem apenas ao denoiser; a renderização continua exclusivamente em CUDA.
+    for device in preferences.devices:
+        if device.type != "CUDA":
+            device.use = False
+    if any(device.type == "OPTIX" for device in optix_devices):
+        denoiser = "OPTIX"
+    elif bool(getattr(_cycles, "with_openimagedenoise", False)):
+        denoiser = "OPENIMAGEDENOISE"
+    else:
+        raise RuntimeError(
+            "O modo --draft exige denoising: nenhum dispositivo OptiX e nenhum "
+            "OpenImageDenoise estão disponíveis. Use um Blender com denoiser suportado "
+            "e uma GPU NVIDIA/driver compatível no Kaggle."
+        )
+    scene.cycles.denoiser = denoiser
+    scene.cycles.use_denoising = True
+    for layer in scene.view_layers:
+        layer.cycles.use_denoising = True
+    print(f"Draft: denoising {denoiser} ativado; render CUDA preservado.", flush=True)
+
+
 def create_pbr_material(
     name: str,
     color: tuple[float, float, float, float],
@@ -374,7 +406,7 @@ def build_scene(
     return scene
 
 
-def render_frame_sequence(scene: bpy.types.Scene, frames_dir: Path) -> None:
+def render_frame_sequence(scene: bpy.types.Scene, frames_dir: Path, *, draft: bool = False) -> None:
     """Salva cada frame atomicamente e retoma somente imagens ausentes/inválidas."""
     frames_dir = frames_dir.expanduser().resolve()
     cache = FrameCache(frames_dir.parent, scene.frame_end,
@@ -387,7 +419,10 @@ def render_frame_sequence(scene: bpy.types.Scene, frames_dir: Path) -> None:
     scene.render.image_settings.color_mode = "RGB"
     scene.render.image_settings.color_depth = "8"
     scene.render.use_file_extension = False
-    disable_denoising(scene)
+    if draft:
+        enable_draft_denoising(scene)
+    else:
+        disable_denoising(scene)
     for frame in range(1, scene.frame_end + 1):
         if frame in status.valid:
             continue
@@ -442,6 +477,14 @@ def render_scene_plan(plan_path: Path, video_path: Path | None = None, *, frames
         raise ValueError("A escala de resolução deve ser um inteiro entre 1 e 100.")
     if not isinstance(samples, int) or samples < 1:
         raise ValueError("O número de amostras deve ser um inteiro positivo.")
+    mode = plan.get("render_mode", "final")
+    if mode not in ("draft", "final", "test-frame"):
+        raise ValueError("Modo de renderização desconhecido no plano.")
+    if mode == "draft" and test_frame is not None:
+        raise ValueError("O plano draft não pode ser usado como teste de um frame.")
+    if mode == "draft":
+        percentage = min(percentage, 25)
+        samples = min(samples, 16)
     if test_frame is not None and not 1 <= test_frame <= plan["frame_end"]:
         raise ValueError("O frame de teste está fora da duração do plano.")
     scene = build_scene(
@@ -458,7 +501,7 @@ def render_scene_plan(plan_path: Path, video_path: Path | None = None, *, frames
         render_test_frame(scene, test_frame, test_output)
         return
     if frames_dir is not None:
-        render_frame_sequence(scene, frames_dir)
+        render_frame_sequence(scene, frames_dir, draft=mode == "draft")
         return
     scene.render.image_settings.file_format = "FFMPEG"
     scene.render.ffmpeg.format = "MPEG4"
@@ -469,7 +512,10 @@ def render_scene_plan(plan_path: Path, video_path: Path | None = None, *, frames
     video_path = video_path.expanduser().resolve()
     video_path.parent.mkdir(parents=True, exist_ok=True)
     scene.render.filepath = str(video_path)
-    disable_denoising(scene)
+    if mode == "draft":
+        enable_draft_denoising(scene)
+    else:
+        disable_denoising(scene)
     bpy.ops.render.render(animation=True)
 
 

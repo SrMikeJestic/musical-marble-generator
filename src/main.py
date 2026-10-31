@@ -45,7 +45,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--descent", type=float, default=0.35, help="Queda em Z por metro em X")
     parser.add_argument("--tail-seconds", type=float, default=1.0,
                         help="Tempo após o fim do MIDI; acima de 1 s acrescenta silêncio")
-    parser.add_argument("--max-duration", type=float,
+    parser.add_argument("--max-duration", "--seconds", dest="max_duration", type=float,
                         help="Limita notas, geometria, vídeo e áudio aos primeiros N segundos")
     parser.add_argument("--resolution-percentage", type=int, default=100,
                         help="Escala de 1 a 100; use 10 para uma prévia rápida")
@@ -56,6 +56,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--force", action="store_true", help="Ignora o cache e renderiza todos os frames novamente")
     parser.add_argument("--test-frame", type=int, help="Renderiza apenas este frame, sem cache, áudio ou vídeo")
     parser.add_argument("--test-output", type=Path, help="PNG do teste; é substituído por um render novo")
+    parser.add_argument("--draft", action="store_true", help="Vídeo com áudio, resolução até 25%%, até 16 samples e denoising")
     return parser
 
 
@@ -63,6 +64,8 @@ def run_pipeline(args: argparse.Namespace) -> Path:
     """Preserva os frames; limpa apenas os temporários de codificação/muxing."""
     midi_path = args.midi.expanduser().resolve()
     testing = args.test_frame is not None
+    if testing and args.draft:
+        raise ValueError("--draft e --test-frame são modos separados; escolha apenas um.")
     if args.test_output is not None and not testing:
         raise ValueError("--test-output requer --test-frame.")
     if testing and args.test_frame < 1:
@@ -90,6 +93,9 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         raise ValueError(f"--max-duration deve ser finito e permitir pelo menos um frame ({1 / FPS:.6f} s).")
     if not 1 <= args.resolution_percentage <= 100 or args.render_samples < 1:
         raise ValueError("Use resolução entre 1 e 100 e pelo menos uma amostra.")
+    mode = "test-frame" if testing else "draft" if args.draft else "final"
+    percentage = min(args.resolution_percentage, 25) if args.draft else args.resolution_percentage
+    samples = min(args.render_samples, 16 if args.draft else 64)
     if not testing:
         ffmpeg = shutil.which(args.ffmpeg)
         if ffmpeg is None:
@@ -120,17 +126,21 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         "segments": [asdict(arc) for arc in arcs],
         "frame_end": frame_count,
         "descent": args.descent,
-        "resolution_percentage": args.resolution_percentage,
-        "render_samples": min(args.render_samples, 64),
+        "resolution_percentage": percentage,
+        "render_samples": samples,
         "max_duration": args.max_duration,
+        "render_mode": mode,
     }
+    cache_root = (args.cache_dir or output.parent / ".marble-cache").expanduser().resolve()
     if testing:
         if args.test_frame > frame_count:
             raise ValueError(f"O frame {args.test_frame} excede o último frame do trecho ({frame_count}).")
         blender = shutil.which(args.blender)
         if blender is None:
             raise RuntimeError("Blender precisa estar instalado para renderizar o frame de teste.")
-        with TemporaryDirectory(prefix="marble-preview-", dir=output.parent) as directory:
+        preview_root = cache_root / "test-frame" / f"frame_{args.test_frame:06d}"
+        preview_root.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix="marble-preview-", dir=preview_root) as directory:
             work = Path(directory)
             plan_path = work / "scene.json"
             preview = work / "test.png"
@@ -142,16 +152,21 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                  "--test-frame", str(args.test_frame), "--test-output", str(preview)],
                 cwd=PROJECT_ROOT, check=True,
             )
-            width, height = render_dimensions(args.resolution_percentage)
+            width, height = render_dimensions(percentage)
             if not valid_png(preview, width, height):
                 raise RuntimeError("O Blender não gerou um PNG de teste completo.")
-            preview.replace(output)
+            isolated = preview_root / f"frame_{args.test_frame:06d}.png"
+            preview.replace(isolated)
+            atomic_json(preview_root / "scene.json", plan)
+            if isolated.resolve() != output:
+                temporary_output = output.with_suffix(".png.part")
+                shutil.copyfile(isolated, temporary_output)
+                temporary_output.replace(output)
         print(f"Teste de um frame concluído: {output}", flush=True)
         return output
     identity = cache_identity(midi_path, plan, PROJECT_ROOT / "src")
-    cache_root = (args.cache_dir or output.parent / ".marble-cache").expanduser().resolve()
-    width, height = render_dimensions(args.resolution_percentage)
-    cache = FrameCache(cache_root / identity["key"], frame_count, width, height)
+    width, height = render_dimensions(percentage)
+    cache = FrameCache(cache_root / mode / identity["key"], frame_count, width, height)
     cache.prepare(identity, force=args.force)
     plan_path = cache.directory / "scene.json"
     atomic_json(plan_path, plan)

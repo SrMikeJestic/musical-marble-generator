@@ -97,6 +97,74 @@ class CyclesGpuTests(unittest.TestCase):
                 self.builder.configure_cycles_gpu(self.scene, value)
         self.assertEqual(self.preferences.compute_device_type, "NONE")
 
+    def test_draft_uses_optix_without_requiring_openimagedenoise(self):
+        self.builder.configure_cycles_gpu(self.scene)
+        self.preferences.get_devices_for_type.return_value = [self.optix, self.cpu]
+        with patch.dict(sys.modules, {"_cycles": NS(with_openimagedenoise=False)}):
+            self.builder.enable_draft_denoising(self.scene)
+        self.assertEqual(self.scene.cycles.denoiser, "OPTIX")
+        self.assertTrue(self.scene.cycles.use_denoising)
+        self.assertTrue(all(layer.cycles.use_denoising for layer in self.scene.view_layers))
+        self.assertEqual(self.scene.cycles.device, "GPU")
+        self.assertEqual(self.preferences.compute_device_type, "CUDA")
+        self.assertTrue(self.cuda.use)
+        self.assertFalse(self.optix.use)
+        self.assertFalse(self.cpu.use)
+        self.assertFalse(self.scene.render.use_compositing)
+
+    def test_draft_uses_oidn_only_if_build_supports_it(self):
+        self.preferences.get_devices_for_type.return_value = []
+        with patch.dict(sys.modules, {"_cycles": NS(with_openimagedenoise=True)}):
+            self.builder.enable_draft_denoising(self.scene)
+        self.assertEqual(self.scene.cycles.denoiser, "OPENIMAGEDENOISE")
+        self.assertTrue(self.scene.cycles.use_denoising)
+
+    def test_draft_reports_missing_denoiser_instead_of_silent_disable(self):
+        self.preferences.get_devices_for_type.return_value = []
+        with patch.dict(sys.modules, {"_cycles": NS(with_openimagedenoise=False)}), \
+             self.assertRaisesRegex(RuntimeError, "nenhum dispositivo OptiX"):
+            self.builder.enable_draft_denoising(self.scene)
+        self.assertFalse(self.scene.cycles.use_denoising)
+
+    def test_frame_writer_does_not_disable_draft_denoising(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.scene.frame_end = 1
+            self.scene.frame_set = Mock()
+            self.scene.render.resolution_x = 18
+            self.scene.render.resolution_y = 32
+            self.scene.render.image_settings = NS()
+
+            def denoise(scene):
+                scene.cycles.use_denoising = True
+
+            def render(**kwargs):
+                self.assertTrue(self.scene.cycles.use_denoising)
+                Path(self.scene.render.filepath).write_bytes(png_bytes(18, 32))
+
+            self.bpy.ops.render = NS(render=Mock(side_effect=render))
+            with patch.object(self.builder, "enable_draft_denoising", side_effect=denoise) as configure:
+                self.builder.render_frame_sequence(self.scene, Path(directory) / "frames", draft=True)
+                configure.assert_called_once_with(self.scene)
+
+    def test_draft_json_caps_profile_even_for_direct_builder_calls(self):
+        from dataclasses import asdict
+        from src.layout_solver import solve_layout
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plan.json"
+            plan = {"schema_version": 1, "fps": 60, "timestamps": [0, 1],
+                    "segments": [asdict(arc) for arc in solve_layout([0, 1])],
+                    "frame_end": 120, "descent": 0.35, "resolution_percentage": 100,
+                    "render_samples": 512, "max_duration": 2, "render_mode": "draft"}
+            path.write_text(json.dumps(plan))
+            frames = Path(directory) / "frames"
+            with patch.object(self.builder, "build_scene", return_value=self.scene) as build, \
+                 patch.object(self.builder, "render_frame_sequence") as render:
+                self.builder.render_scene_plan(path, frames_dir=frames)
+                self.assertEqual(build.call_args.kwargs["render_samples"], 16)
+                self.assertEqual((self.scene.render.resolution_x, self.scene.render.resolution_y), (270, 480))
+                render.assert_called_once_with(self.scene, frames, draft=True)
+
     def test_frame_sequence_resumes_only_missing_or_corrupt_images(self):
         with tempfile.TemporaryDirectory() as directory:
             frames = Path(directory) / "frames"

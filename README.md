@@ -14,9 +14,13 @@ Se CUDA ou a GPU não estiverem disponíveis, o script encerra com erro antes de
 construir a geometria. Não há fallback para CPU. O máximo é de 64 samples por
 frame; `--render-samples` permite menos amostras para prévias e valores maiores
 são limitados a 64. O vidro mantém a aproximação translúcida por shader.
-O denoising de render, prévia e camadas é desativado explicitamente, assim como
-os passes auxiliares de denoising e o compositor, para suportar builds sem
-OpenImageDenoise. Não é necessário instalar nem selecionar um denoiser.
+No render final e em `--test-frame`, o denoising de render, prévia e camadas é
+desativado explicitamente, assim como os passes auxiliares e o compositor, para
+suportar builds sem OpenImageDenoise. O modo `--draft` habilita denoising nativo:
+prefere OptiX em GPU disponível e usa OpenImageDenoise somente se o build o inclui.
+Sem nenhum denoiser suportado, o draft encerra com uma mensagem clara; não tenta
+usar uma biblioteca ausente. A renderização permanece em CUDA e o compositor fica
+desativado em todos os modos.
 
 ```bash
 python -m venv .venv
@@ -60,7 +64,9 @@ python src/main.py input.mid --soundfont instrumento.sf2 --max-duration 15 \
 ```
 
 `--cache-dir` usa uma pasta já montada; sem a opção, o cache fica em
-`.marble-cache` ao lado da saída. Cada render tem uma subpasta identificada pelo
+`.marble-cache` ao lado da saída. As pastas são isoladas fisicamente por modo:
+`final/<chave>/frames`, `draft/<chave>/frames` e `test-frame/frame_<n>/`.
+Cada render de vídeo tem uma subpasta identificada pelo
 conteúdo do MIDI, plano, configurações e código do builder (incluindo câmera e
 materiais). Mudanças nesses dados geram outro cache automaticamente.
 
@@ -94,7 +100,8 @@ display(Image(filename="/kaggle/working/passo1_frame150.png"))
 
 Se o Blender estiver fora do `PATH`, adicione `--blender /caminho/para/blender`.
 Esse modo sempre renderiza exatamente um PNG novo, mesmo se o arquivo de saída
-ou o cache da animação já existirem. Não consulta nem modifica o cache, não
+ou o cache da animação já existirem. Não consulta nem modifica os caches de vídeo;
+registra o PNG de diagnóstico em `test-frame/` e copia para `--test-output`. Não
 codifica vídeo e não sintetiza áudio; SoundFont e FFmpeg não são necessários.
 Sem `--test-output`, salva `test_frame_000150.png` ao lado da saída padrão. O
 frame escolhido deve pertencer à duração do trecho. Para localizar um impacto,
@@ -115,6 +122,43 @@ Para limitar uma música longa aos primeiros 15 segundos:
 ```bash
 python src/main.py input.mid --soundfont instrumento.sf2 --max-duration 15
 ```
+
+`--seconds` é um alias de `--max-duration`; ambos preservam o mesmo cálculo e
+recorte desde o início do MIDI. Para um teste completo de dois segundos, com
+vídeo **e áudio**, use `--draft --seconds 2`. O draft limita a resolução a 25%
+(270×480) e as amostras a 16; opções explícitas menores são respeitadas. Os
+argumentos `--test-frame`, `--max-duration`, `--resolution-percentage` e
+`--test-output` continuam disponíveis. `--draft` e `--test-frame` são modos
+separados e não devem ser combinados.
+
+Em um notebook Kaggle limpo, com internet habilitada, instale o áudio nesta célula
+(não depende de o repositório já estar no diretório atual):
+
+```python
+!apt-get update -qq
+!DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg libfluidsynth3 libsndfile1 timgm6mb-soundfont
+%pip install -q "pretty_midi>=0.2.11,<0.3" "pyfluidsynth>=1.3.3,<2" "numpy>=1.26,<3" "soundfile>=0.12,<1" "gTTS>=2.5,<3"
+
+import os
+os.environ["SOUNDFONT"] = "/usr/share/sounds/sf2/TimGM6mb.sf2"
+```
+
+Com GPU habilitada e Blender 4.0.2 no `PATH`, execute na raiz do repositório:
+
+```bash
+python src/main.py /kaggle/input/seu-dataset/musica.mid \
+  --draft --seconds 2 --soundfont /usr/share/sounds/sf2/TimGM6mb.sf2 \
+  --cache-dir /kaggle/working/marble-cache \
+  -o /kaggle/working/draft_2s.mp4 --overwrite
+```
+
+Em uma música com pelo menos dois contatos nos primeiros dois segundos, o limite
+produz até 120 frames a 60 FPS, incluindo a cauda dentro dos dois segundos. O
+CLI só pula o Blender quando a sequência tem exatamente todos os frames esperados
+e nenhum PNG extra/inválido. Um frame ausente reativa a retomada; `--force` apaga
+os frames daquele job draft e força a reescrita, preservando os outros modos.
+As pastas e o número de frames válidos são mostrados no terminal. Para persistir
+entre sessões Kaggle, exporte/salve a pasta de cache junto com os outputs.
 
 O limite é absoluto, contado desde o início do MIDI, incluindo o silêncio inicial
 e a cauda sonora. O solver descarta notas posteriores antes de calcular os arcos;

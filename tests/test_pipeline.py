@@ -245,7 +245,7 @@ class PipelineTests(unittest.TestCase):
         drive = self.root / "Google Drive" / "render cache"
         with patch("src.main.subprocess.run", side_effect=self.fake_run), patch("src.main.render_midi_audio"):
             run_pipeline(self.args("--cache-dir", str(drive)))
-        self.assertEqual(len(list(drive.glob("*/frames/*.png"))), 135)
+        self.assertEqual(len(list(drive.glob("final/*/frames/*.png"))), 135)
         with patch("src.main.shutil.which", side_effect=lambda name: None if name == "blender" else "/usr/bin/ffmpeg"), \
              patch("src.main.subprocess.run", side_effect=self.fake_run) as run, \
              patch("src.main.render_midi_audio"):
@@ -258,7 +258,7 @@ class PipelineTests(unittest.TestCase):
     def test_force_renders_from_zero_even_with_complete_cache(self, *_):
         with patch("src.main.subprocess.run", side_effect=self.fake_run), patch("src.main.render_midi_audio"):
             run_pipeline(self.args())
-        frames = next((self.root / ".marble-cache").glob("*/frames"))
+        frames = next((self.root / ".marble-cache").glob("final/*/frames"))
         self.assertEqual(len(list(frames.glob("*.png"))), 135)
 
         def forced_run(command, **kwargs):
@@ -275,7 +275,7 @@ class PipelineTests(unittest.TestCase):
     def test_incomplete_or_corrupt_cache_never_skips_blender(self, *_):
         with patch("src.main.subprocess.run", side_effect=self.fake_run), patch("src.main.render_midi_audio"):
             run_pipeline(self.args())
-        frames = next((self.root / ".marble-cache").glob("*/frames"))
+        frames = next((self.root / ".marble-cache").glob("final/*/frames"))
         (frames / "frame_000002.png").unlink()
         (frames / "frame_000003.png").write_bytes(b"corrupt")
         first = frames / "frame_000001.png"
@@ -298,7 +298,7 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Renderização incompleta: 1/135"):
                 run_pipeline(self.args())
             audio.assert_not_called()
-        self.assertEqual(len(list((self.root / ".marble-cache").glob("*/frames/*.png"))), 1)
+        self.assertEqual(len(list((self.root / ".marble-cache").glob("final/*/frames/*.png"))), 1)
         self.assertFalse(self.output.exists())
 
     @patch("src.main.ctypes.util.find_library", return_value="libfluidsynth.so.3")
@@ -311,7 +311,7 @@ class PipelineTests(unittest.TestCase):
 
         with patch("src.main.subprocess.run", side_effect=disconnected), self.assertRaises(subprocess.CalledProcessError):
             run_pipeline(self.args())
-        frames = next((self.root / ".marble-cache").glob("*/frames"))
+        frames = next((self.root / ".marble-cache").glob("final/*/frames"))
         with patch("src.main.subprocess.run", side_effect=self.fake_run), patch("src.main.render_midi_audio"):
             run_pipeline(self.args())
         self.assertEqual((frames / "frame_000001.png").read_bytes(), png_bytes(18, 32, 80))
@@ -339,7 +339,7 @@ class PipelineTests(unittest.TestCase):
             with patch("src.main.subprocess.run", side_effect=self.fake_run) as run:
                 run_pipeline(self.args("--overwrite"))
                 self.assertTrue(any("--scene-json" in call.args[0] for call in run.call_args_list))
-        self.assertEqual(len(list((self.root / ".marble-cache").glob("*/cache.json"))), 3)
+        self.assertEqual(len(list((self.root / ".marble-cache").glob("final/*/cache.json"))), 3)
 
     def test_visual_preview_ignores_cache_and_requires_no_audio_tools(self):
         cache = self.root / "persistent-cache"
@@ -375,6 +375,100 @@ class PipelineTests(unittest.TestCase):
                 run_pipeline(self.args("--test-frame", frame))
             run.assert_not_called()
 
+    def draft_run(self, command, **kwargs):
+        if "--scene-json" in command:
+            plan = json.loads(Path(command[command.index("--scene-json") + 1]).read_text())
+            self.assertEqual(plan["render_mode"], "draft")
+            self.assertEqual(plan["frame_end"], 120)
+            self.assertEqual(plan["resolution_percentage"], 25)
+            self.assertEqual(plan["render_samples"], 16)
+            self.assertEqual(plan["max_duration"], 2.0)
+            self.assertIn("draft", Path(command[command.index("--frames-dir") + 1]).parts)
+            finish_frames(command)
+        elif "-framerate" in command:
+            self.assertEqual(command[command.index("-frames:v") + 1], "120")
+            Path(command[-1]).write_bytes(b"draft video")
+        else:
+            self.assertEqual(command[command.index("-t") + 1], "2.000000000")
+            self.assertIn("aac", command)
+            Path(command[-1]).write_bytes(b"draft with audio")
+        return subprocess.CompletedProcess(command, 0)
+
+    def draft_args(self, *extra):
+        return _parser().parse_args([
+            str(self.midi), "--soundfont", str(self.soundfont), "-o", str(self.output),
+            "--draft", "--seconds", "2", *extra,
+        ])
+
+    @patch("src.main.ctypes.util.find_library", return_value="libfluidsynth.so.3")
+    @patch("src.main.shutil.which", side_effect=lambda name: f"/usr/bin/{name}")
+    def test_draft_seconds_runs_complete_audio_pipeline_and_profiles(self, *_):
+        args = self.draft_args()
+        self.assertEqual(args.max_duration, 2)
+        with patch("src.main.subprocess.run", side_effect=self.draft_run) as run, \
+             patch("src.main.render_midi_audio") as audio:
+            run_pipeline(args)
+            audio.assert_called_once()
+            self.assertEqual(audio.call_args.kwargs["duration"], 2)
+            self.assertEqual(run.call_count, 3)
+        self.assertEqual(self.output.read_bytes(), b"draft with audio")
+        self.assertEqual(len(list((self.root / ".marble-cache").glob("draft/*/frames/*.png"))), 120)
+
+    @patch("src.main.ctypes.util.find_library", return_value="libfluidsynth.so.3")
+    @patch("src.main.shutil.which", side_effect=lambda name: f"/usr/bin/{name}")
+    def test_draft_cache_missing_frame_and_force_reactivate_blender(self, *_):
+        with patch("src.main.subprocess.run", side_effect=self.draft_run), patch("src.main.render_midi_audio"):
+            run_pipeline(self.draft_args())
+        frames = next((self.root / ".marble-cache").glob("draft/*/frames"))
+        with patch("src.main.subprocess.run", side_effect=self.draft_run) as run, patch("src.main.render_midi_audio"):
+            run_pipeline(self.draft_args("--overwrite"))
+            self.assertEqual(run.call_count, 2)
+        (frames / "frame_000002.png").unlink()
+        with patch("src.main.subprocess.run", side_effect=self.draft_run) as run, patch("src.main.render_midi_audio"):
+            run_pipeline(self.draft_args("--overwrite"))
+            self.assertEqual(sum("--scene-json" in call.args[0] for call in run.call_args_list), 1)
+
+        def forced(command, **kwargs):
+            if "--scene-json" in command:
+                self.assertEqual(list(frames.glob("*.png")), [])
+            return self.draft_run(command, **kwargs)
+
+        with patch("src.main.subprocess.run", side_effect=forced) as run, patch("src.main.render_midi_audio"):
+            run_pipeline(self.draft_args("--force", "--overwrite"))
+            self.assertEqual(sum("--scene-json" in call.args[0] for call in run.call_args_list), 1)
+        self.assertEqual(len(list(frames.glob("*.png"))), 120)
+
+    @patch("src.main.ctypes.util.find_library", return_value="libfluidsynth.so.3")
+    @patch("src.main.shutil.which", side_effect=lambda name: f"/usr/bin/{name}")
+    def test_test_frame_draft_and_final_frames_are_physically_separate(self, *_):
+        def render_mode(command, **kwargs):
+            if "--test-frame" in command:
+                Path(command[command.index("--test-output") + 1]).write_bytes(png_bytes(18, 32))
+            elif "--scene-json" in command:
+                finish_frames(command)
+            else:
+                Path(command[-1]).write_bytes(b"video")
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch("src.main.subprocess.run", side_effect=render_mode), patch("src.main.render_midi_audio"):
+            run_pipeline(self.args("--seconds", "2"))
+            run_pipeline(self.args("--draft", "--seconds", "2", "--overwrite"))
+            run_pipeline(self.args("--test-frame", "50"))
+        cache = self.root / ".marble-cache"
+        self.assertEqual({p.name for p in cache.iterdir()}, {"final", "draft", "test-frame"})
+        self.assertEqual(len(list(cache.glob("final/*/frames/*.png"))), 120)
+        self.assertEqual(len(list(cache.glob("draft/*/frames/*.png"))), 120)
+        self.assertTrue((cache / "test-frame/frame_000050/frame_000050.png").is_file())
+
+    def test_seconds_alias_preserves_existing_options_and_rejects_mixed_modes(self):
+        self.assertIn("25%", _parser().format_help())
+        self.assertIn("--seconds", _parser().format_help())
+        self.assertEqual(self.args("--seconds", "2").max_duration, 2)
+        self.assertEqual(self.args("--max-duration", "2").max_duration, 2)
+        self.assertEqual(self.args("--resolution-percentage", "50").resolution_percentage, 50)
+        with self.assertRaisesRegex(ValueError, "modos separados"):
+            run_pipeline(self.args("--draft", "--test-frame", "50"))
+
     @patch("src.main.ctypes.util.find_library", return_value="libfluidsynth.so.3")
     @patch("src.main.shutil.which", side_effect=lambda name: f"/usr/bin/{name}")
     def test_failure_cleans_temporary_files_and_preserves_existing_output(self, *_):
@@ -385,7 +479,7 @@ class PipelineTests(unittest.TestCase):
             run_pipeline(self.args("--overwrite"))
         self.assertEqual(self.output.read_bytes(), b"previous video")
         self.assertEqual(list(self.root.glob("marble-*")), [])
-        self.assertEqual(len(list((self.root / ".marble-cache").glob("*/frames/*.png"))), 135)
+        self.assertEqual(len(list((self.root / ".marble-cache").glob("final/*/frames/*.png"))), 135)
 
     @patch("src.main.ctypes.util.find_library", return_value="libfluidsynth.so.3")
     @patch("src.main.shutil.which", side_effect=lambda name: f"/usr/bin/{name}")
