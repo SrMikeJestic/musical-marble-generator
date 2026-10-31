@@ -31,7 +31,7 @@ o Python embutido no Blender usa apenas `bpy` e a biblioteca padrão.
 
 O CLI interpreta mudanças de andamento, agrupa notas simultâneas em um contato
 da bolinha e calcula os arcos com o solver. Em seguida, entrega um JSON ao Blender,
-renderiza MP4/H.264 a 1080×1920 e 60 FPS, sintetiza WAV mono PCM de 24 bits a
+renderiza frames PNG a 1080×1920 e 60 FPS, codifica H.264 pelo FFmpeg e sintetiza WAV mono PCM de 24 bits a
 48 kHz com FluidSynth e combina vídeo e áudio AAC de 320 kb/s pelo FFmpeg.
 Sem limite de duração, todas as notas e instrumentos do MIDI original permanecem no áudio.
 
@@ -40,8 +40,41 @@ Contatos entre frames inteiros mantêm chaves fracionárias. O silêncio inicial
 preservado e a câmera/bolinha aguardam no primeiro contato; após o último contato,
 a imagem permanece na última plataforma até o fim do MIDI mais um segundo de
 cauda. A duração é arredondada para frames completos e aplicada também ao áudio.
-O diretório temporário é removido ao concluir ou falhar, e a saída só é publicada
-após o muxing. Use `--overwrite` para substituir um vídeo existente.
+Os frames e o plano da cena permanecem no cache após sucesso ou falha; apenas os
+temporários de codificação e áudio são removidos. A saída só é publicada após o
+muxing. Use `--overwrite` para substituir um vídeo existente.
+
+Para persistir o progresso no Google Drive, monte-o no notebook do Colab:
+
+```python
+from google.colab import drive
+drive.mount("/content/drive")
+```
+
+Depois execute:
+
+```bash
+python src/main.py input.mid --soundfont instrumento.sf2 --max-duration 15 \
+  --cache-dir "/content/drive/MyDrive/marble-cache" \
+  -o "/content/drive/MyDrive/output_final.mp4"
+```
+
+`--cache-dir` usa uma pasta já montada; sem a opção, o cache fica em
+`.marble-cache` ao lado da saída. Cada render tem uma subpasta identificada pelo
+conteúdo do MIDI, plano, configurações e código do builder (incluindo câmera e
+materiais). Mudanças nesses dados geram outro cache automaticamente.
+
+Os arquivos são `frames/frame_000001.png`, `frame_000002.png`, etc. O Blender
+grava primeiro um `.png.part` e só publica o PNG após verificar sua integridade.
+O CLI só pula a etapa 3D se houver **exatamente** os frames `1..N` esperados, sem
+PNGs extras, todos com dimensões corretas, CRCs e dados comprimidos válidos.
+Sequências incompletas retomam apenas frames ausentes ou corrompidos. Uma
+desconexão não apaga os frames concluídos na pasta persistente. Na próxima sessão,
+monte o mesmo Drive e use o mesmo comando e diretório de cache.
+
+`--force` apaga a sequência do cache daquele render e começa do zero, mesmo que
+esteja completa. Outros renders na raiz do cache são preservados. Se o MP4 final
+já existir, acrescente também `--overwrite`; essa opção controla apenas a saída.
 
 Para uma prévia rápida, reduza resolução e amostras:
 

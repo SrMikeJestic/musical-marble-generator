@@ -6,7 +6,6 @@
 
 import argparse
 import ctypes.util
-import json
 import math
 import os
 import shutil
@@ -20,11 +19,13 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from src.audio_renderer import render_midi_audio
     from src.config import FPS
+    from src.frame_cache import FrameCache, atomic_json, cache_identity, render_dimensions
     from src.layout_solver import solve_layout
     from src.midi_parser import parse_midi
 else:
     from .audio_renderer import render_midi_audio
     from .config import FPS
+    from .frame_cache import FrameCache, atomic_json, cache_identity, render_dimensions
     from .layout_solver import solve_layout
     from .midi_parser import parse_midi
 
@@ -49,11 +50,14 @@ def _parser() -> argparse.ArgumentParser:
                         help="Escala de 1 a 100; use 10 para uma prévia rápida")
     parser.add_argument("--render-samples", type=int, default=64, help="Amostras Cycles por frame (máximo 64)")
     parser.add_argument("--overwrite", action="store_true", help="Permite substituir a saída existente")
+    parser.add_argument("--cache-dir", type=Path,
+                        help="Pasta persistente para frames (ex.: Google Drive já montado)")
+    parser.add_argument("--force", action="store_true", help="Ignora o cache e renderiza todos os frames novamente")
     return parser
 
 
 def run_pipeline(args: argparse.Namespace) -> Path:
-    """Limpa temporários inclusive em falhas; publica a saída só após o muxing."""
+    """Preserva os frames; limpa apenas os temporários de codificação/muxing."""
     midi_path = args.midi.expanduser().resolve()
     if args.soundfont is None:
         raise ValueError("Informe --soundfont arquivo.sf2 ou configure SOUNDFONT.")
@@ -76,10 +80,9 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         raise ValueError(f"--max-duration deve ser finito e permitir pelo menos um frame ({1 / FPS:.6f} s).")
     if not 1 <= args.resolution_percentage <= 100 or args.render_samples < 1:
         raise ValueError("Use resolução entre 1 e 100 e pelo menos uma amostra.")
-    blender = shutil.which(args.blender)
     ffmpeg = shutil.which(args.ffmpeg)
-    if blender is None or ffmpeg is None:
-        raise RuntimeError("Blender e FFmpeg precisam estar instalados e acessíveis no PATH.")
+    if ffmpeg is None:
+        raise RuntimeError("FFmpeg precisa estar instalado e acessível no PATH.")
     if ctypes.util.find_library("fluidsynth") is None:
         raise RuntimeError("Instale a biblioteca nativa libfluidsynth para sintetizar o MIDI.")
 
@@ -99,34 +102,57 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         raise ValueError("O limite não contém notas antes do fim dos frames completos do vídeo.")
     print(f"Plano: {len(timestamps)} contatos, {frame_count} frames, {duration:.3f} s.", flush=True)
     output.parent.mkdir(parents=True, exist_ok=True)
+    plan = {
+        "schema_version": 1,
+        "fps": FPS,
+        "timestamps": list(timestamps),
+        "segments": [asdict(arc) for arc in arcs],
+        "frame_end": frame_count,
+        "descent": args.descent,
+        "resolution_percentage": args.resolution_percentage,
+        "render_samples": min(args.render_samples, 64),
+        "max_duration": args.max_duration,
+    }
+    identity = cache_identity(midi_path, plan, PROJECT_ROOT / "src")
+    cache_root = (args.cache_dir or output.parent / ".marble-cache").expanduser().resolve()
+    width, height = render_dimensions(args.resolution_percentage)
+    cache = FrameCache(cache_root / identity["key"], frame_count, width, height)
+    cache.prepare(identity, force=args.force)
+    plan_path = cache.directory / "scene.json"
+    atomic_json(plan_path, plan)
+    status = cache.inspect()
+    if status.complete:
+        print(f"B: Cache completo: {frame_count}/{frame_count} frames válidos. Pulando Blender.", flush=True)
+    else:
+        blender = shutil.which(args.blender)
+        if blender is None:
+            raise RuntimeError("Blender precisa estar instalado para completar o cache.")
+        print(f"B: Cache incompleto: {len(status.valid)}/{frame_count} frames. Retomando Blender...", flush=True)
+        cache.prune_invalid(status)
+        subprocess.run(
+            [blender, "--background", "--factory-startup", "--python-exit-code", "1", "--python",
+             "src/blender_builder.py", "--", "--scene-json", str(plan_path),
+             "--frames-dir", str(cache.frames)],
+            cwd=PROJECT_ROOT, check=True,
+        )
+        status = cache.inspect()
+        if not status.complete:
+            raise RuntimeError(f"Renderização incompleta: {len(status.valid)}/{frame_count} frames válidos.")
+
     with TemporaryDirectory(prefix="marble-", dir=output.parent) as directory:
         work = Path(directory)
-        plan_path = work / "scene.json"
         video_path = work / "temp_video.mp4"
         audio_path = work / "temp_audio.wav"
         final_path = work / "output_final.mp4"
-        plan = {
-            "schema_version": 1,
-            "fps": FPS,
-            "timestamps": timestamps,
-            "segments": [asdict(arc) for arc in arcs],
-            "frame_end": frame_count,
-            "descent": args.descent,
-            "resolution_percentage": args.resolution_percentage,
-            "render_samples": args.render_samples,
-            "max_duration": args.max_duration,
-        }
-        plan_path.write_text(json.dumps(plan, ensure_ascii=False, allow_nan=False), encoding="utf-8")
-
-        print("B: Renderizando vídeo no Blender...", flush=True)
+        print("B: Codificando sequência de frames em H.264...", flush=True)
         subprocess.run(
-            [blender, "--background", "--python-exit-code", "1", "--python",
-             "src/blender_builder.py", "--", "--scene-json", str(plan_path),
-             "--video-output", str(video_path)],
-            cwd=PROJECT_ROOT, check=True,
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+             "-framerate", str(FPS), "-start_number", "1", "-i", str(cache.frames / "frame_%06d.png"),
+             "-frames:v", str(frame_count), "-c:v", "libx264", "-crf", "18",
+             "-pix_fmt", "yuv420p", str(video_path)], check=True,
         )
         if not video_path.is_file() or video_path.stat().st_size == 0:
-            raise RuntimeError("O Blender não gerou o vídeo esperado.")
+            raise RuntimeError("O FFmpeg não gerou o vídeo esperado.")
 
         print("C: Sintetizando áudio com FluidSynth...", flush=True)
         render_midi_audio(midi_path, soundfont_path, audio_path, duration=duration)
@@ -143,7 +169,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         if not final_path.is_file() or final_path.stat().st_size == 0:
             raise RuntimeError("O FFmpeg não gerou o MP4 final.")
         final_path.replace(output)
-    print(f"E: Temporários removidos. Vídeo final: {output}", flush=True)
+    print(f"E: Temporários removidos; frames preservados em {cache.frames}. Vídeo final: {output}", flush=True)
     return output
 
 

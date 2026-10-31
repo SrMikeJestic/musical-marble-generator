@@ -2,10 +2,14 @@
 
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
+
+from png_helpers import png_bytes
+from src.frame_cache import valid_png
 
 
 class CyclesGpuTests(unittest.TestCase):
@@ -91,6 +95,58 @@ class CyclesGpuTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.builder.configure_cycles_gpu(self.scene, value)
         self.assertEqual(self.preferences.compute_device_type, "NONE")
+
+    def test_frame_sequence_resumes_only_missing_or_corrupt_images(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frames = Path(directory) / "frames"
+            frames.mkdir()
+            first = frames / "frame_000001.png"
+            first.write_bytes(png_bytes(18, 32, 80))
+            (frames / "frame_000002.png").write_bytes(b"truncated")
+            self.scene.frame_end = 3
+            self.scene.frame_set = Mock()
+            self.scene.render.resolution_x = 18
+            self.scene.render.resolution_y = 32
+            self.scene.render.image_settings = NS()
+
+            def render(**kwargs):
+                self.assertEqual(kwargs, {"write_still": True})
+                path = Path(self.scene.render.filepath)
+                self.assertEqual(path.suffix, ".part")
+                path.write_bytes(png_bytes(18, 32))
+
+            self.bpy.ops.render = NS(render=Mock(side_effect=render))
+            self.builder.render_frame_sequence(self.scene, frames)
+            self.assertEqual([call.args[0] for call in self.scene.frame_set.call_args_list], [2, 3])
+            self.assertEqual(first.read_bytes(), png_bytes(18, 32, 80))
+            self.assertTrue(all(valid_png(frames / f"frame_{i:06d}.png", 18, 32) for i in range(1, 4)))
+            self.assertEqual(list(frames.glob("*.part")), [])
+            self.bpy.ops.render.render.reset_mock()
+            self.builder.render_frame_sequence(self.scene, frames)
+            self.bpy.ops.render.render.assert_not_called()
+
+    def test_interruption_keeps_finished_frames_and_never_publishes_partial_png(self):
+        with tempfile.TemporaryDirectory() as directory:
+            frames = Path(directory) / "frames"
+            self.scene.frame_end = 3
+            self.scene.frame_set = Mock()
+            self.scene.render.resolution_x = 18
+            self.scene.render.resolution_y = 32
+            self.scene.render.image_settings = NS()
+
+            def interrupt(**kwargs):
+                path = Path(self.scene.render.filepath)
+                if self.scene.frame_set.call_args.args[0] == 2:
+                    path.write_bytes(b"incomplete PNG")
+                    raise RuntimeError("Colab disconnected")
+                path.write_bytes(png_bytes(18, 32))
+
+            self.bpy.ops.render = NS(render=Mock(side_effect=interrupt))
+            with self.assertRaisesRegex(RuntimeError, "disconnected"):
+                self.builder.render_frame_sequence(self.scene, frames)
+            self.assertTrue(valid_png(frames / "frame_000001.png", 18, 32))
+            self.assertFalse((frames / "frame_000002.png").exists())
+            self.assertTrue((frames / "frame_000002.png.part").exists())
 
 
 if __name__ == "__main__":

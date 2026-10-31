@@ -2,8 +2,8 @@
 
 blender --background --python-exit-code 1 --python tests/blender_40_smoke.py
 
-Exige GPU NVIDIA CUDA. Constrói materiais/geometria, verifica contatos e renderiza um MP4
-curto via JSON. Os arquivos de teste ficam em um diretório temporário.
+Exige GPU NVIDIA CUDA. Constrói materiais/geometria, verifica contatos e renderiza
+uma sequência PNG curta via JSON. Os arquivos ficam em um diretório temporário.
 """
 
 import json
@@ -18,6 +18,7 @@ import bpy
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.blender_builder import BALL_RADIUS, build_scene, render_scene_plan
 from src.layout_solver import solve_layout
+from src.frame_cache import FrameCache
 
 
 def main() -> None:
@@ -48,9 +49,13 @@ def main() -> None:
         }
         plan_path = root / "scene.json"
         plan_path.write_text(json.dumps(plan), encoding="utf-8")
-        video_path = root / "video.mp4"
-        render_scene_plan(plan_path, video_path)
-        assert video_path.is_file() and video_path.stat().st_size > 0
+        frames_dir = root / "frames"
+        render_scene_plan(plan_path, frames_dir=frames_dir)
+        assert FrameCache(root, 3, 108, 192).inspect().complete
+        before = {path.name: (path.stat().st_mtime_ns, path.read_bytes()) for path in frames_dir.glob("*.png")}
+        render_scene_plan(plan_path, frames_dir=frames_dir)
+        after = {path.name: (path.stat().st_mtime_ns, path.read_bytes()) for path in frames_dir.glob("*.png")}
+        assert before == after
         scene = bpy.context.scene
         assert scene.frame_end == 3
         assert len([obj for obj in scene.objects if obj.name.startswith("Platform_")]) == 3
@@ -69,7 +74,7 @@ def main() -> None:
         assert not any(device.type != "CUDA" and device.use for device in preferences.devices)
         assert (scene.render.resolution_x, scene.render.resolution_y) == (108, 192)
         assert scene.render.fps == 60 and scene.render.fps_base == 1.0
-        assert scene.render.ffmpeg.codec == "H264"
+        assert scene.render.image_settings.file_format == "PNG"
         assert scene.camera.constraints[0].target == scene.objects["Marble"]
         assert all(obj.rigid_body is None for obj in scene.objects)
 
@@ -93,7 +98,7 @@ def main() -> None:
                 assert any(abs(key.co.x - 2.5) < 1e-5 for key in curve.keyframe_points)
         bpy.ops.wm.save_as_mainfile(filepath=str(root / "scene.blend"))
         assert (root / "scene.blend").is_file()
-    print("Blender 4.0.2 CUDA OK: materiais, geometria, câmera, frames fracionários, .blend e H.264.")
+    print("Blender 4.0.2 CUDA OK: materiais, geometria, câmera, frames fracionários, .blend e cache PNG.")
 
 
 if __name__ == "__main__":

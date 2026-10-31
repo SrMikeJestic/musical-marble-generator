@@ -5,6 +5,8 @@ Execute da raiz do projeto com Blender 4.0.2 e uma GPU NVIDIA CUDA disponível::
     blender --background --python src/blender_builder.py
 
 O exemplo salva ``test_scene.blend`` na raiz do projeto, sem renderizar vídeo.
+Com ``-- --scene-json plano.json --frames-dir pasta``, salva PNGs persistentes
+e retoma somente frames ausentes ou inválidos.
 Com ``-- --scene-json plano.json --video-output video.mp4``, consome o plano do
 orquestrador e renderiza a animação H.264, sem criar o arquivo de teste.
 Os tempos absolutos do solver são preservados: frame = 1 + timestamp * FPS.
@@ -19,6 +21,7 @@ aceleração vertical. Use descent=0 para visualizar o layout horizontal origina
 import argparse
 import json
 import math
+import os
 import sys
 from bisect import bisect_right
 from pathlib import Path
@@ -32,9 +35,11 @@ from mathutils import Vector
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from src.config import FPS, RESOLUTION_PERCENTAGE, RESOLUTION_X, RESOLUTION_Y
+    from src.frame_cache import FrameCache, render_dimensions, valid_png
     from src.layout_solver import TrajectorySegment, solve_layout
 else:
     from .config import FPS, RESOLUTION_PERCENTAGE, RESOLUTION_X, RESOLUTION_Y
+    from .frame_cache import FrameCache, render_dimensions, valid_png
     from .layout_solver import TrajectorySegment, solve_layout
 
 
@@ -368,8 +373,38 @@ def build_scene(
     return scene
 
 
-def render_scene_plan(plan_path: Path, video_path: Path) -> None:
-    """Consome a matemática calculada pelo CLI e renderiza um MP4 sem áudio."""
+def render_frame_sequence(scene: bpy.types.Scene, frames_dir: Path) -> None:
+    """Salva cada frame atomicamente e retoma somente imagens ausentes/inválidas."""
+    frames_dir = frames_dir.expanduser().resolve()
+    cache = FrameCache(frames_dir.parent, scene.frame_end,
+                       scene.render.resolution_x, scene.render.resolution_y)
+    cache.frames = frames_dir
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    status = cache.inspect()
+    cache.prune_invalid(status)
+    scene.render.image_settings.file_format = "PNG"
+    scene.render.image_settings.color_mode = "RGB"
+    scene.render.image_settings.color_depth = "8"
+    scene.render.use_file_extension = False
+    disable_denoising(scene)
+    for frame in range(1, scene.frame_end + 1):
+        if frame in status.valid:
+            continue
+        target = cache.frame_path(frame)
+        temporary = target.with_suffix(".png.part")
+        scene.frame_set(frame)
+        scene.render.filepath = str(temporary)
+        bpy.ops.render.render(write_still=True)
+        if not valid_png(temporary, cache.width, cache.height):
+            raise RuntimeError(f"O Blender gerou um PNG incompleto no frame {frame}.")
+        os.replace(temporary, target)
+        print(f"Frame {frame}/{scene.frame_end} salvo: {target}", flush=True)
+
+
+def render_scene_plan(plan_path: Path, video_path: Path | None = None, *, frames_dir: Path | None = None) -> None:
+    """Consome o JSON e exporta frames persistentes ou um MP4 independente."""
+    if (video_path is None) == (frames_dir is None):
+        raise ValueError("Informe um diretório de frames ou uma saída de vídeo.")
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     if plan["schema_version"] != 1 or plan["fps"] != FPS:
         raise ValueError("Versão do plano ou FPS incompatíveis com este builder.")
@@ -386,12 +421,12 @@ def render_scene_plan(plan_path: Path, video_path: Path) -> None:
         max_duration=plan.get("max_duration"),
         render_samples=samples,
     )
-    # H.264 exige dimensões pares. Múltiplos de 18x32 preservam também o 9:16
-    # em escalas pequenas, cuja porcentagem pode produzir dimensões ímpares.
-    scale_unit = max(2, 2 * round((RESOLUTION_X / 9) * percentage / 200))
-    scene.render.resolution_x = 9 * scale_unit
-    scene.render.resolution_y = 16 * scale_unit
+    # A sequência PNG também será codificada em H.264 pelo orquestrador.
+    scene.render.resolution_x, scene.render.resolution_y = render_dimensions(percentage)
     scene.render.resolution_percentage = 100
+    if frames_dir is not None:
+        render_frame_sequence(scene, frames_dir)
+        return
     scene.render.image_settings.file_format = "FFMPEG"
     scene.render.ffmpeg.format = "MPEG4"
     scene.render.ffmpeg.codec = "H264"
@@ -409,11 +444,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Constrói cena de teste ou renderiza plano JSON.")
     parser.add_argument("--scene-json", type=Path)
     parser.add_argument("--video-output", type=Path)
+    parser.add_argument("--frames-dir", type=Path)
     args = parser.parse_args(sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else [])
-    if args.scene_json is not None or args.video_output is not None:
-        if args.scene_json is None or args.video_output is None:
-            parser.error("--scene-json e --video-output devem ser usados juntos.")
-        render_scene_plan(args.scene_json, args.video_output)
+    if args.scene_json is not None or args.video_output is not None or args.frames_dir is not None:
+        if args.scene_json is None or (args.video_output is None) == (args.frames_dir is None):
+            parser.error("Use --scene-json com exatamente uma opção: --video-output ou --frames-dir.")
+        render_scene_plan(args.scene_json, args.video_output, frames_dir=args.frames_dir)
     else:
         build_scene([0.0, 0.5, 1.1, 1.55, 2.2, 2.7, 3.25, 3.8])
         output_path = Path(__file__).resolve().parents[1] / "test_scene.blend"
