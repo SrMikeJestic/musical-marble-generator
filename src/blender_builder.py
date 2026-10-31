@@ -7,6 +7,8 @@ Execute da raiz do projeto com Blender 4.0.2 e uma GPU NVIDIA CUDA disponível::
 O exemplo salva ``test_scene.blend`` na raiz do projeto, sem renderizar vídeo.
 Com ``-- --scene-json plano.json --frames-dir pasta``, salva PNGs persistentes
 e retoma somente frames ausentes ou inválidos.
+Com ``-- --scene-json plano.json --test-frame 150 --test-output teste.png``,
+renderiza somente um PNG novo, ignorando o cache da animação.
 Com ``-- --scene-json plano.json --video-output video.mp4``, consome o plano do
 orquestrador e renderiza a animação H.264, sem criar o arquivo de teste.
 Os tempos absolutos do solver são preservados: frame = 1 + timestamp * FPS.
@@ -28,7 +30,6 @@ from pathlib import Path
 from typing import Iterable
 
 import bpy
-from mathutils import Vector
 
 # --python executa este arquivo sem contexto de pacote. Permite também importá-lo
 # normalmente com `from src.blender_builder import build_scene` dentro do Blender.
@@ -187,31 +188,35 @@ def _make_platform(
     assign_material(pin, chrome)
 
 
-def _setup_lighting(scene: bpy.types.Scene) -> None:
+def _setup_lighting(scene: bpy.types.Scene, ball: bpy.types.Object) -> None:
+    """Estúdio contrastante que acompanha a trajetória, com fundo pouco iluminado."""
     world = bpy.data.worlds.new("MarbleWorld")
     world.use_nodes = True
     world.node_tree.nodes["Background"].inputs["Color"].default_value = (
-        0.55, 0.65, 0.80, 1.0
+        0.008, 0.012, 0.022, 1.0
     )
-    world.node_tree.nodes["Background"].inputs["Strength"].default_value = 0.35
+    world.node_tree.nodes["Background"].inputs["Strength"].default_value = 0.05
     scene.world = world
 
-    bpy.ops.object.light_add(type="SUN", location=(-4.0, -6.0, 10.0))
-    sun = bpy.context.object
-    sun.name = "KeySun"
-    sun.data.energy = 3.0
-    sun.data.angle = math.radians(1.0)
-    sun.data.use_shadow = True
-    # Raios viajam para a parede (+Y) e para baixo (-Z).
-    sun.rotation_euler = Vector((0.45, 1.0, -0.7)).to_track_quat("-Z", "Y").to_euler()
-
-    # Preenchimento amplo acompanha a câmera e cria reflexos no vidro/cromo.
-    bpy.ops.object.light_add(type="AREA")
-    fill = bpy.context.object
-    fill.name = "CameraFill"
-    fill.data.energy = 500.0
-    fill.data.shape = "DISK"
-    fill.data.size = 5.0
+    for name, location, energy, size, color in (
+        ("StudioKey", (-3.0, -4.0, 5.0), 1800.0, 1.5, (1.0, 0.86, 0.72)),
+        ("StudioFill", (3.0, -2.0, 1.5), 75.0, 3.0, (0.65, 0.78, 1.0)),
+        ("StudioRim", (2.0, 0.6, 3.0), 800.0, 1.0, (0.35, 0.55, 1.0)),
+    ):
+        bpy.ops.object.light_add(type="AREA")
+        light = bpy.context.object
+        light.name = name
+        light.parent = ball
+        light.location = location
+        light.data.energy = energy
+        light.data.shape = "DISK"
+        light.data.size = size
+        light.data.color = color
+        light.data.use_shadow = True
+        tracking = light.constraints.new("TRACK_TO")
+        tracking.target = ball
+        tracking.track_axis = "TRACK_NEGATIVE_Z"
+        tracking.up_axis = "UP_Y"
 
 
 def build_scene(
@@ -281,7 +286,7 @@ def build_scene(
         "PinChrome", (0.72, 0.76, 0.82, 1.0), metallic=1.0, roughness=0.18
     )
     wall_material = create_pbr_material(
-        "PastelWall", (0.64, 0.73, 0.80, 1.0), roughness=0.90
+        "StudioBackdrop", (0.05, 0.065, 0.09, 1.0), roughness=0.90
     )
     plastics = [
         create_pbr_material(f"PlatformPlastic_{i}", color, roughness=0.65)
@@ -342,11 +347,7 @@ def build_scene(
     tracking.up_axis = "UP_Y"
     scene.camera = camera
 
-    _setup_lighting(scene)
-    fill = scene.objects["CameraFill"]
-    fill.parent = camera
-    fill.location = (-3.0, 3.0, -1.0)
-    fill.rotation_euler = (0.0, 0.0, 0.0)
+    _setup_lighting(scene, ball)
 
     # Incluir contatos fracionários evita deslocar notas que não caem em 1/60 s.
     keyframes = {float(frame) for frame in range(scene.frame_start, scene.frame_end + 1)}
@@ -401,9 +402,36 @@ def render_frame_sequence(scene: bpy.types.Scene, frames_dir: Path) -> None:
         print(f"Frame {frame}/{scene.frame_end} salvo: {target}", flush=True)
 
 
-def render_scene_plan(plan_path: Path, video_path: Path | None = None, *, frames_dir: Path | None = None) -> None:
-    """Consome o JSON e exporta frames persistentes ou um MP4 independente."""
-    if (video_path is None) == (frames_dir is None):
+def render_test_frame(scene: bpy.types.Scene, frame: int, output: Path) -> None:
+    """Renderiza exatamente um frame novo, sem ler ou escrever o cache da animação."""
+    if not isinstance(frame, int) or not scene.frame_start <= frame <= scene.frame_end:
+        raise ValueError(f"O frame de teste deve estar entre {scene.frame_start} e {scene.frame_end}.")
+    output = output.expanduser().resolve()
+    if output.suffix.lower() != ".png":
+        raise ValueError("A saída do frame de teste deve ser um PNG.")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_suffix(".png.part")
+    scene.render.image_settings.file_format = "PNG"
+    scene.render.image_settings.color_mode = "RGB"
+    scene.render.image_settings.color_depth = "8"
+    scene.render.use_file_extension = False
+    scene.render.filepath = str(temporary)
+    scene.frame_set(frame)
+    disable_denoising(scene)
+    bpy.ops.render.render(write_still=True)
+    if not valid_png(temporary, scene.render.resolution_x, scene.render.resolution_y):
+        raise RuntimeError("O frame de teste gerado está incompleto.")
+    os.replace(temporary, output)
+    print(f"Frame de teste {frame} renderizado sem cache: {output}", flush=True)
+
+
+def render_scene_plan(plan_path: Path, video_path: Path | None = None, *, frames_dir: Path | None = None,
+                      test_frame: int | None = None, test_output: Path | None = None) -> None:
+    """Consome o JSON e exporta um frame de teste, frames persistentes ou MP4."""
+    if test_frame is not None:
+        if test_output is None or frames_dir is not None or video_path is not None:
+            raise ValueError("Use --test-frame com --test-output, sem saídas de animação.")
+    elif test_output is not None or (video_path is None) == (frames_dir is None):
         raise ValueError("Informe um diretório de frames ou uma saída de vídeo.")
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     if plan["schema_version"] != 1 or plan["fps"] != FPS:
@@ -414,6 +442,8 @@ def render_scene_plan(plan_path: Path, video_path: Path | None = None, *, frames
         raise ValueError("A escala de resolução deve ser um inteiro entre 1 e 100.")
     if not isinstance(samples, int) or samples < 1:
         raise ValueError("O número de amostras deve ser um inteiro positivo.")
+    if test_frame is not None and not 1 <= test_frame <= plan["frame_end"]:
+        raise ValueError("O frame de teste está fora da duração do plano.")
     scene = build_scene(
         plan["timestamps"], descent=plan["descent"],
         segments=[TrajectorySegment(**segment) for segment in plan["segments"]],
@@ -424,6 +454,9 @@ def render_scene_plan(plan_path: Path, video_path: Path | None = None, *, frames
     # A sequência PNG também será codificada em H.264 pelo orquestrador.
     scene.render.resolution_x, scene.render.resolution_y = render_dimensions(percentage)
     scene.render.resolution_percentage = 100
+    if test_frame is not None:
+        render_test_frame(scene, test_frame, test_output)
+        return
     if frames_dir is not None:
         render_frame_sequence(scene, frames_dir)
         return
@@ -445,8 +478,16 @@ def main() -> None:
     parser.add_argument("--scene-json", type=Path)
     parser.add_argument("--video-output", type=Path)
     parser.add_argument("--frames-dir", type=Path)
+    parser.add_argument("--test-frame", type=int)
+    parser.add_argument("--test-output", type=Path)
     args = parser.parse_args(sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else [])
-    if args.scene_json is not None or args.video_output is not None or args.frames_dir is not None:
+    if args.test_frame is not None or args.test_output is not None:
+        if args.scene_json is None or args.test_frame is None or args.test_output is None:
+            parser.error("Use --scene-json, --test-frame e --test-output juntos.")
+        if args.video_output is not None or args.frames_dir is not None:
+            parser.error("O teste de um frame não aceita saídas de animação.")
+        render_scene_plan(args.scene_json, test_frame=args.test_frame, test_output=args.test_output)
+    elif args.scene_json is not None or args.video_output is not None or args.frames_dir is not None:
         if args.scene_json is None or (args.video_output is None) == (args.frames_dir is None):
             parser.error("Use --scene-json com exatamente uma opção: --video-output ou --frames-dir.")
         render_scene_plan(args.scene_json, args.video_output, frames_dir=args.frames_dir)

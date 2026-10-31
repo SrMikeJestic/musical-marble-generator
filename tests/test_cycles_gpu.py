@@ -1,6 +1,7 @@
 """Verifica seleção CUDA e limites sem exigir bpy/GPU no Python do CLI."""
 
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -147,6 +148,45 @@ class CyclesGpuTests(unittest.TestCase):
             self.assertTrue(valid_png(frames / "frame_000001.png", 18, 32))
             self.assertFalse((frames / "frame_000002.png").exists())
             self.assertTrue((frames / "frame_000002.png.part").exists())
+
+    def test_preview_renders_one_fresh_frame_without_using_animation_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "frame150.png"
+            output.write_bytes(png_bytes(18, 32, 80))
+            self.scene.frame_start = 1
+            self.scene.frame_end = 900
+            self.scene.frame_set = Mock()
+            self.scene.render.resolution_x = 18
+            self.scene.render.resolution_y = 32
+            self.scene.render.image_settings = NS()
+
+            def render(**kwargs):
+                Path(self.scene.render.filepath).write_bytes(png_bytes(18, 32))
+
+            self.bpy.ops.render = NS(render=Mock(side_effect=render))
+            with patch.object(self.builder.FrameCache, "inspect", side_effect=AssertionError("cache used")):
+                self.builder.render_test_frame(self.scene, 150, output)
+            self.bpy.ops.render.render.assert_called_once_with(write_still=True)
+            self.scene.frame_set.assert_called_once_with(150)
+            self.assertEqual(output.read_bytes(), png_bytes(18, 32))
+
+    def test_json_preview_never_dispatches_animation_renderer(self):
+        from dataclasses import asdict
+        from src.layout_solver import solve_layout
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plan.json"
+            plan = {"schema_version": 1, "fps": 60, "timestamps": [0, 3],
+                    "segments": [asdict(arc) for arc in solve_layout([0, 3])],
+                    "frame_end": 900, "descent": 0.35, "resolution_percentage": 10,
+                    "render_samples": 64, "max_duration": None}
+            path.write_text(json.dumps(plan))
+            output = Path(directory) / "preview.png"
+            with patch.object(self.builder, "build_scene", return_value=self.scene), \
+                 patch.object(self.builder, "render_test_frame") as preview, \
+                 patch.object(self.builder, "render_frame_sequence", side_effect=AssertionError("animation used")):
+                self.builder.render_scene_plan(path, test_frame=150, test_output=output)
+                preview.assert_called_once_with(self.scene, 150, output)
 
 
 if __name__ == "__main__":

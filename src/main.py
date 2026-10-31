@@ -2,6 +2,7 @@
 
     python src/main.py input.mid --soundfont instrumento.sf2
     python -m src.main input.mid --soundfont instrumento.sf2 -o output_final.mp4
+    python src/main.py input.mid --test-frame 150 --test-output teste.png
 """
 
 import argparse
@@ -19,13 +20,13 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from src.audio_renderer import render_midi_audio
     from src.config import FPS
-    from src.frame_cache import FrameCache, atomic_json, cache_identity, render_dimensions
+    from src.frame_cache import FrameCache, atomic_json, cache_identity, render_dimensions, valid_png
     from src.layout_solver import solve_layout
     from src.midi_parser import parse_midi
 else:
     from .audio_renderer import render_midi_audio
     from .config import FPS
-    from .frame_cache import FrameCache, atomic_json, cache_identity, render_dimensions
+    from .frame_cache import FrameCache, atomic_json, cache_identity, render_dimensions, valid_png
     from .layout_solver import solve_layout
     from .midi_parser import parse_midi
 
@@ -53,22 +54,31 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-dir", type=Path,
                         help="Pasta persistente para frames (ex.: Google Drive já montado)")
     parser.add_argument("--force", action="store_true", help="Ignora o cache e renderiza todos os frames novamente")
+    parser.add_argument("--test-frame", type=int, help="Renderiza apenas este frame, sem cache, áudio ou vídeo")
+    parser.add_argument("--test-output", type=Path, help="PNG do teste; é substituído por um render novo")
     return parser
 
 
 def run_pipeline(args: argparse.Namespace) -> Path:
     """Preserva os frames; limpa apenas os temporários de codificação/muxing."""
     midi_path = args.midi.expanduser().resolve()
-    if args.soundfont is None:
+    testing = args.test_frame is not None
+    if args.test_output is not None and not testing:
+        raise ValueError("--test-output requer --test-frame.")
+    if testing and args.test_frame < 1:
+        raise ValueError("--test-frame deve ser um inteiro positivo.")
+    if not testing and args.soundfont is None:
         raise ValueError("Informe --soundfont arquivo.sf2 ou configure SOUNDFONT.")
-    soundfont_path = args.soundfont.expanduser().resolve()
-    output = args.output.expanduser().resolve()
-    for path in (midi_path, soundfont_path):
+    soundfont_path = args.soundfont.expanduser().resolve() if args.soundfont is not None else None
+    output = ((args.test_output or args.output.with_name(f"test_frame_{args.test_frame:06d}.png"))
+              if testing else args.output).expanduser().resolve()
+    for path in ((midi_path,) if testing else (midi_path, soundfont_path)):
         if not path.is_file():
             raise FileNotFoundError(path)
-    if output.suffix.lower() != ".mp4" or output in (midi_path, soundfont_path):
-        raise ValueError("A saída deve ser um arquivo .mp4 diferente das entradas.")
-    if output.exists() and not args.overwrite:
+    extension = ".png" if testing else ".mp4"
+    if output.suffix.lower() != extension or output in (midi_path, soundfont_path):
+        raise ValueError(f"A saída deve ser um arquivo {extension} diferente das entradas.")
+    if output.exists() and not args.overwrite and not testing:
         raise FileExistsError(f"A saída já existe: {output}. Use --overwrite para substituí-la.")
     if not math.isfinite(args.descent) or args.descent < 0:
         raise ValueError("--descent deve ser finito e não negativo.")
@@ -80,11 +90,12 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         raise ValueError(f"--max-duration deve ser finito e permitir pelo menos um frame ({1 / FPS:.6f} s).")
     if not 1 <= args.resolution_percentage <= 100 or args.render_samples < 1:
         raise ValueError("Use resolução entre 1 e 100 e pelo menos uma amostra.")
-    ffmpeg = shutil.which(args.ffmpeg)
-    if ffmpeg is None:
-        raise RuntimeError("FFmpeg precisa estar instalado e acessível no PATH.")
-    if ctypes.util.find_library("fluidsynth") is None:
-        raise RuntimeError("Instale a biblioteca nativa libfluidsynth para sintetizar o MIDI.")
+    if not testing:
+        ffmpeg = shutil.which(args.ffmpeg)
+        if ffmpeg is None:
+            raise RuntimeError("FFmpeg precisa estar instalado e acessível no PATH.")
+        if ctypes.util.find_library("fluidsynth") is None:
+            raise RuntimeError("Instale a biblioteca nativa libfluidsynth para sintetizar o MIDI.")
 
     print("A: Interpretando MIDI e calculando trajetórias...", flush=True)
     timeline = parse_midi(midi_path)
@@ -113,6 +124,30 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         "render_samples": min(args.render_samples, 64),
         "max_duration": args.max_duration,
     }
+    if testing:
+        if args.test_frame > frame_count:
+            raise ValueError(f"O frame {args.test_frame} excede o último frame do trecho ({frame_count}).")
+        blender = shutil.which(args.blender)
+        if blender is None:
+            raise RuntimeError("Blender precisa estar instalado para renderizar o frame de teste.")
+        with TemporaryDirectory(prefix="marble-preview-", dir=output.parent) as directory:
+            work = Path(directory)
+            plan_path = work / "scene.json"
+            preview = work / "test.png"
+            atomic_json(plan_path, plan)
+            print(f"Teste visual: somente frame {args.test_frame}; cache ignorado.", flush=True)
+            subprocess.run(
+                [blender, "--background", "--factory-startup", "--python-exit-code", "1", "--python",
+                 "src/blender_builder.py", "--", "--scene-json", str(plan_path),
+                 "--test-frame", str(args.test_frame), "--test-output", str(preview)],
+                cwd=PROJECT_ROOT, check=True,
+            )
+            width, height = render_dimensions(args.resolution_percentage)
+            if not valid_png(preview, width, height):
+                raise RuntimeError("O Blender não gerou um PNG de teste completo.")
+            preview.replace(output)
+        print(f"Teste de um frame concluído: {output}", flush=True)
+        return output
     identity = cache_identity(midi_path, plan, PROJECT_ROOT / "src")
     cache_root = (args.cache_dir or output.parent / ".marble-cache").expanduser().resolve()
     width, height = render_dimensions(args.resolution_percentage)

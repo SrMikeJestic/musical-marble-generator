@@ -76,6 +76,33 @@ monte o mesmo Drive e use o mesmo comando e diretório de cache.
 esteja completa. Outros renders na raiz do cache são preservados. Se o MP4 final
 já existir, acrescente também `--overwrite`; essa opção controla apenas a saída.
 
+O roteiro visual está em [PLANO.md](PLANO.md). O Passo 1 usa World escuro, fundo
+fosco escuro e três luzes Area: principal quente, preenchimento fraco e recorte
+frio. As luzes acompanham a esfera e mantêm o contraste ao longo da trajetória.
+
+Para validar **somente um frame**, no notebook Kaggle, ative uma GPU NVIDIA e
+deixe o Blender 4.0.2 no `PATH`. Execute na raiz do repositório:
+
+```python
+!python src/main.py "/kaggle/input/seu-dataset/musica.mid" \
+    --test-frame 150 --max-duration 15 --resolution-percentage 50 \
+    --test-output "/kaggle/working/passo1_frame150.png"
+
+from IPython.display import Image, display
+display(Image(filename="/kaggle/working/passo1_frame150.png"))
+```
+
+Se o Blender estiver fora do `PATH`, adicione `--blender /caminho/para/blender`.
+Esse modo sempre renderiza exatamente um PNG novo, mesmo se o arquivo de saída
+ou o cache da animação já existirem. Não consulta nem modifica o cache, não
+codifica vídeo e não sintetiza áudio; SoundFont e FFmpeg não são necessários.
+Sem `--test-output`, salva `test_frame_000150.png` ao lado da saída padrão. O
+frame escolhido deve pertencer à duração do trecho. Para localizar um impacto,
+leia os timestamps do MIDI/plano usando `frame = 1 + 60 * timestamp`; o frame
+150 é apenas um exemplo e pode não coincidir com um impacto em toda música.
+Os materiais avançados, a emissão, o DoF e os carris permanecem para os próximos
+passos do plano, após aprovação.
+
 Para uma prévia rápida, reduza resolução e amostras:
 
 ```bash

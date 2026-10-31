@@ -341,6 +341,40 @@ class PipelineTests(unittest.TestCase):
                 self.assertTrue(any("--scene-json" in call.args[0] for call in run.call_args_list))
         self.assertEqual(len(list((self.root / ".marble-cache").glob("*/cache.json"))), 3)
 
+    def test_visual_preview_ignores_cache_and_requires_no_audio_tools(self):
+        cache = self.root / "persistent-cache"
+        cache.mkdir()
+        sentinel = cache / "keep.png"
+        sentinel.write_bytes(png_bytes(18, 32, 80))
+        output = self.root / "step1.png"
+        output.write_bytes(png_bytes(18, 32, 80))
+        args = _parser().parse_args([str(self.midi), "--test-frame", "50", "--test-output", str(output),
+                                     "--resolution-percentage", "1", "--cache-dir", str(cache)])
+
+        def render(command, **kwargs):
+            self.assertEqual(command[command.index("--test-frame") + 1], "50")
+            self.assertNotIn("--frames-dir", command)
+            self.assertNotIn("--video-output", command)
+            Path(command[command.index("--test-output") + 1]).write_bytes(png_bytes(18, 32))
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch("src.main.shutil.which", return_value="/usr/bin/blender"), \
+             patch("src.main.subprocess.run", side_effect=render) as run, \
+             patch("src.main.cache_identity", side_effect=AssertionError("cache used")), \
+             patch("src.main.render_midi_audio", side_effect=AssertionError("audio used")), \
+             patch("src.main.ctypes.util.find_library", side_effect=AssertionError("audio dependency checked")):
+            self.assertEqual(run_pipeline(args), output)
+            run.assert_called_once()
+        self.assertEqual(output.read_bytes(), png_bytes(18, 32))
+        self.assertEqual(sentinel.read_bytes(), png_bytes(18, 32, 80))
+        self.assertEqual(list(self.root.glob("marble-preview-*")), [])
+
+    def test_invalid_preview_frame_fails_before_calling_blender(self):
+        for frame in ("0", "-1", "150"):
+            with self.subTest(frame=frame), patch("src.main.subprocess.run") as run, self.assertRaises(ValueError):
+                run_pipeline(self.args("--test-frame", frame))
+            run.assert_not_called()
+
     @patch("src.main.ctypes.util.find_library", return_value="libfluidsynth.so.3")
     @patch("src.main.shutil.which", side_effect=lambda name: f"/usr/bin/{name}")
     def test_failure_cleans_temporary_files_and_preserves_existing_output(self, *_):
